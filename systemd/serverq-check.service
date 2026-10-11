@@ -3,7 +3,7 @@ Description=ServerQ read-only server compliance audit
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/python3 %h/.serverq/app/serverq.py check
+ExecStart=/usr/bin/python3 %h/.serverq/bootstrap/serverq.py check
 SuccessExitStatus=1
 UMask=0077
 NoNewPrivileges=yes
