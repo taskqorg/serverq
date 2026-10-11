@@ -92,6 +92,42 @@ def journal():
         return {'status': 'unknown', 'detail': str(exc)}
 
 
+def docker_logs():
+    # Always inspect this host's system daemon, regardless of the caller's Docker context.
+    if not shutil.which('docker'):
+        return {'status': 'unknown' if Path('/var/run/docker.sock').exists() else 'ok',
+                'detail': 'Docker CLI unavailable' if Path('/var/run/docker.sock').exists() else 'System Docker not installed'}
+    argv = ['docker', '--host', 'unix:///var/run/docker.sock']
+    try:
+        ids = command(argv + ['container', 'ls', '--all', '--quiet', '--no-trunc']).split()
+        if len(ids) != len(set(ids)) or any(not re.fullmatch(r'[0-9a-f]{64}', value) for value in ids):
+            raise ValueError('Invalid container inventory')
+        lines = command(argv + ['inspect', '--type', 'container', '--format', '{{json .HostConfig.LogConfig}}', *ids]).splitlines() if ids else []
+        if len(lines) != len(ids):
+            raise ValueError('Incomplete container inspection')
+        deviations, unsupported = [], []
+        for container, line in zip(ids, lines):
+            config = json.loads(line)
+            if not isinstance(config, dict) or not isinstance(config.get('Config'), dict) or not isinstance(config.get('Type'), str):
+                raise ValueError('Invalid log configuration')
+            driver, options = config['Type'], config['Config']
+            if driver in ('none', 'journald'):
+                continue
+            if driver not in ('json-file', 'local'):
+                unsupported.append(container)
+                continue
+            size, count = options.get('max-size', ''), options.get('max-file', '')
+            valid_size = isinstance(size, str) and re.fullmatch(r'[0-9]+(?:\.[0-9]+)?(?:[kmg]b?|b)?', size, re.I)
+            if not (valid_size and float(re.match(r'[0-9.]+', size)[0]) > 0 and
+                    isinstance(count, str) and re.fullmatch(r'[1-9][0-9]*', count)):
+                deviations.append(container)
+        return {'status': 'unknown' if unsupported else 'warn' if deviations else 'ok',
+                'detail': f'{len(ids)} containers inspected; {len(deviations)} lack explicit positive rotation; {len(unsupported)} unsupported log drivers',
+                'missing_rotation': deviations, 'unsupported': unsupported}
+    except (RuntimeError, ValueError, TypeError) as exc:
+        return {'status': 'unknown', 'detail': f'Docker log collection failed: {type(exc).__name__}'}
+
+
 def journal_fingerprint():
     digest = hashlib.sha256()
     for directory in ('/usr/lib/systemd', '/usr/local/lib/systemd', '/run/systemd', '/etc/systemd'):
@@ -187,6 +223,7 @@ def audit(home, filesystem, force=False):
         for key in ('disk-headroom', 'inode-headroom'):
             results[key] = {'status': 'unknown', 'detail': f'Filesystem collection failed: {type(exc).__name__}'}
     results['failed-services'] = failed_units()
+    results['bounded-docker-logs'] = docker_logs()
     try:
         results['bounded-journal'] = cached(cache, 'bounded-journal', journal_fingerprint(), now,
                                             rules['bounded-journal']['ttl_seconds'], journal)

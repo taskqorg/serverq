@@ -1,11 +1,11 @@
 {
   "disk-headroom": {
     "minimum_percent": 15,
-    "instruction": "Keep at least 15% filesystem space free. Investigate growth before scoped cleanup; never prune unidentified data."
+    "instruction": "Keep filesystem space above this rule's minimum. Investigate growth before scoped cleanup; disk pressure never expands deletion eligibility."
   },
   "inode-headroom": {
     "minimum_percent": 10,
-    "instruction": "Keep at least 10% inodes free; investigate high file counts before deleting."
+    "instruction": "Keep free inodes above this rule's minimum; investigate high file counts before deleting."
   },
   "failed-services": {
     "instruction": "Investigate failed system services. Never reset failure state instead of fixing and verifying the cause."
@@ -14,13 +14,16 @@
     "ttl_seconds": 86400,
     "instruction": "Set explicit positive SystemMaxUse, SystemKeepFree and RuntimeMaxUse limits for journald, sized for this host."
   },
+  "bounded-docker-logs": {
+    "instruction": "Bound logs on every system-Docker container: explicit positive max-size and max-file for json-file/local, or bounded journald. Check existing containers; daemon defaults do not retrofit them. Other drivers require manual verification."
+  },
   "service-contract": {
     "manual": true,
     "instruction": "Every installed service declares owner, purpose, health check, resource limits, persistent data paths, bounded logs/cache retention, backup and verified restore for valuable data, update/rollback path, and uninstall procedure. Bound Docker logs per container; daemon defaults do not retrofit existing containers."
   },
   "safe-maintenance": {
     "manual": true,
-    "instruction": "Use one owned scheduler per job, finite deadlines, single-run locks, private bounded state and observable failure/recovery. Cleanup requires explicit ownership, retention and inactivity proof; retain unknown data. Never use blind docker prune --volumes, kill unrelated jobs or interrupt writes."
+    "instruction": "Use one owned scheduler per job, finite deadlines, single-run locks, private bounded state and fresh outcome reports. Monitor failed/missing/stale results and recovery. Cleanup requires ownership, retention and inactivity proof; preserve unknown data, active writes and rollback artifacts. Never use blind docker prune --volumes."
   },
   "verified-repair": {
     "manual": true,

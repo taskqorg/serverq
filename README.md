@@ -27,6 +27,10 @@ JSON output and private `~/.serverq/report.json` show `ok`, `warn`, or `unknown`
 
 State, reports, updater status, and the lock remain in `~/.serverq` (mode 0700; JSON mode 0600). Dynamic capacity/service checks run every time. Corrupt state is an error, not a reset or a healthy result.
 
+Docker log rotation is checked on every existing container (including stopped containers) on the local system daemon, ignoring remote Docker contexts. JSON/local logging needs explicit positive rotation; journald logging uses the journal check. Other drivers return `unknown` pending manual verification. Rootless daemons remain a manual inventory item. Applying daemon defaults alone does not repair existing containers.
+
+For a new host, inventory capacity and growth, preview owned cleanup, apply scoped settings/retention, then rerun `check` and service health probes. Keep host paths, owners, retention and rollback evidence private. The agreed reusable rules stay only in `rules.json`. Feed report deviations and missing/stale/failed checks into the existing monitor; do not add a second cleaner or scheduler.
+
 ## Stable-release updates
 
 The updater only uses the public `taskqorg/serverq` GitHub Releases API and asset URLs from that release. It rejects drafts, prereleases, downgrade/incompatible schemas, malformed metadata, non-GitHub asset URLs, oversized downloads, checksum mismatches, unsafe ZIP paths/symlinks, and failed packaged tests/checks. It uses bounded download and subprocess timeouts and never reads or prints credentials/tokens.
@@ -50,7 +54,7 @@ The builder packages the exact checker, rules, metadata, docs, tests, and user u
 Download the reviewed release ZIP and manifest from GitHub Releases, verify the manifest checksum, then run the bootstrap updater from an isolated staging directory. This does not change system configuration.
 
 ```sh
-release=0.2.0
+release=0.2.1
 stage=$(mktemp -d)
 base="https://github.com/taskqorg/serverq/releases/download/v$release"
 curl --fail --location "$base/serverq-$release.zip" -o "$stage/serverq-$release.zip"

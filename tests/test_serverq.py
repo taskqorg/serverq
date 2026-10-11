@@ -65,6 +65,46 @@ class ServerQTests(unittest.TestCase):
         with patch.object(sq.subprocess, 'run', side_effect=FileNotFoundError):
             self.assertEqual(sq.failed_units()['status'], 'unknown')
 
+    def test_docker_rotation_checks_existing_containers_on_local_daemon(self):
+        ids = ['a' * 64, 'b' * 64]
+        valid = {'Type': 'json-file', 'Config': {'max-size': '10m', 'max-file': '3'}}
+        with patch.object(sq.shutil, 'which', return_value='/usr/bin/docker'), patch.object(sq, 'command') as probe:
+            probe.side_effect = ['\n'.join(ids), '\n'.join(map(json.dumps, [valid, {'Type': 'json-file', 'Config': {}}]))]
+            result = sq.docker_logs()
+            self.assertEqual(result['status'], 'warn')
+            self.assertEqual(result['missing_rotation'], [ids[1]])
+            self.assertEqual(probe.call_args_list[0].args[0][:3], ['docker', '--host', 'unix:///var/run/docker.sock'])
+            self.assertIn('--all', probe.call_args_list[0].args[0])
+            self.assertEqual(probe.call_args_list[1].args[0][-2:], ids)
+
+    def test_docker_rotation_bounds_and_supported_drivers(self):
+        for driver, options, status in (
+            ('json-file', {'max-size': '10m', 'max-file': '3'}, 'ok'),
+            ('local', {'max-size': '1.5MB', 'max-file': '1'}, 'ok'),
+            ('local', {}, 'warn'),
+            ('json-file', {'max-size': '-1', 'max-file': '3'}, 'warn'),
+            ('json-file', {'max-size': '0m', 'max-file': '3'}, 'warn'),
+            ('json-file', {'max-size': '10m', 'max-file': '0'}, 'warn'),
+            ('journald', {}, 'ok'), ('none', {}, 'ok'), ('fluentd', {}, 'unknown'),
+        ):
+            with self.subTest(driver=driver, options=options), patch.object(sq.shutil, 'which', return_value='docker'), patch.object(sq, 'command', side_effect=['a' * 64, json.dumps({'Type': driver, 'Config': options})]):
+                self.assertEqual(sq.docker_logs()['status'], status)
+
+    def test_docker_collection_fails_closed(self):
+        cases = [RuntimeError('denied'), 'invalid-id', 'a' * 64 + '\n' + 'a' * 64]
+        for output in cases:
+            with self.subTest(output=output), patch.object(sq.shutil, 'which', return_value='docker'), patch.object(sq, 'command', side_effect=[output]):
+                self.assertEqual(sq.docker_logs()['status'], 'unknown')
+        for output in ('', '{}', 'null', '{broken', json.dumps({'Type': 'json-file', 'Config': None})):
+            with self.subTest(output=output), patch.object(sq.shutil, 'which', return_value='docker'), patch.object(sq, 'command', side_effect=['a' * 64, output]):
+                self.assertEqual(sq.docker_logs()['status'], 'unknown')
+        with patch.object(sq.shutil, 'which', return_value='docker'), patch.object(sq, 'command', return_value=''):
+            self.assertEqual(sq.docker_logs()['status'], 'ok')
+        with patch.object(sq.shutil, 'which', return_value=None), patch.object(sq.Path, 'exists', return_value=False):
+            self.assertEqual(sq.docker_logs()['status'], 'ok')
+        with patch.object(sq.shutil, 'which', return_value=None), patch.object(sq.Path, 'exists', return_value=True):
+            self.assertEqual(sq.docker_logs()['status'], 'unknown')
+
     def test_real_cli_isolated_state_and_failure(self):
         import subprocess
         import sys
@@ -73,7 +113,7 @@ class ServerQTests(unittest.TestCase):
             result = subprocess.run(argv, capture_output=True, text=True, timeout=20)
             self.assertIn(result.returncode, (0, 1, 2))
             report = json.loads(result.stdout)
-            self.assertEqual(len(report['results']), 4)
+            self.assertEqual(set(report['results']), {'disk-headroom', 'inode-headroom', 'failed-services', 'bounded-journal', 'bounded-docker-logs'})
             again = subprocess.run(argv, capture_output=True, text=True, timeout=20)
             second = json.loads(again.stdout)
             if report['results']['bounded-journal']['status'] != 'unknown':
