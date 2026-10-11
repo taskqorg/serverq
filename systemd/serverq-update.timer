@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily ServerQ stable-release update check
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=1d
+RandomizedDelaySec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
