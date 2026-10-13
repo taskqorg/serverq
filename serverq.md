@@ -6,6 +6,7 @@ serverq checks a Linux server against the agreed server-care rules and reports d
 
 [specq verification](https://github.com/taskqorg/specq/blob/main/engineering/verification.md) binds serverq: unknown is never healthy (here the status `unknown`), and remediation is scoped and separate.
 
+- **Connection target.** [Independent enrollment](docs/design/enrollment.md) adds explicitly approved observation delivery through coreq; primary checks and recommendations remain read-only. No AgentQ/Langfuse dependency.
 - **Read-only.** serverq writes only its own install folder. It never changes server settings, deletes operator data, resets failures, restarts other services, runs AI or applies recommendations. Remediation is a separate action by an agent or operator.
 - **One catalog.** `rules.json` at the repository root is the only recommendation catalog. The binary embeds its exact bytes at build time; no other file, doc or agent copies its thresholds.
 - **Dynamic checks every time.** Capacity and service checks run on every pass. Only configuration checks are cached (§ 3).
@@ -104,7 +105,7 @@ A Windows host runs the service and reports the Linux-only rules as unknown; Win
 - `schtasks /End` ends only the launcher, so `stop`, `restart` (then `/Run`), `uninstall` and a reinstall also end every other `serverq.exe` running from the install folder, except the caller and its launcher. `uninstall` deletes the task, failing when this user may not (a task registered elevated), and its XML, never the install folder.
 - Check: every rule whose probe is Linux-only is `unknown` with `reason: unsupported-os`, never `ok`, so `check` exits 2. On Windows that is all five automated rules (no `statvfs`, systemd or system Docker socket); on macOS the three systemd and Docker rules. `report.json` adds `reason` to those results only.
 - Files: no Unix modes or folder fsync; the install folder keeps the user's ACL. The lock opens with write access, which Windows needs to lock it.
-- dashq shows the host once hosts push `status.json` (dashq #4); serverq adds no own channel.
+- DashQ receives the allowlisted projection through the shared enrollment client; never upload raw `status.json` or `report.json`.
 
 ## 8. Checks
 
