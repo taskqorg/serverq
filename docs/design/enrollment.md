@@ -8,7 +8,7 @@ Send only a coalesced latest unsent snapshot. Connection state and credentials a
 
 ## ServerQ projection
 
-Existing checks, report/state formats and rules.json remain authoritative. Produce an allowlisted projection: installation/runtime/version, catalog hash, per-rule ID/status/original observation time/reason, numeric evidence and incident verification state. Manual rules stay unverified; unsupported probes stay unknown. Retain schema-1 readers through additive metadata only. Never export raw detail, paths, unit names, container IDs or report.json wholesale; use fixed-vocabulary reasons. Recommendations reference the exact rule/catalog revision, never duplicate thresholds.
+Existing checks, report/state formats and rules.json remain authoritative. Produce an allowlisted projection: installation/runtime/version, catalog hash, per-rule ID/status/original observation time/reason, numeric evidence and incident verification state. Manual rules stay unverified; unsupported probes stay unknown. Retain schema-1 readers through additive metadata only. Never export raw detail, paths, unit names, container IDs or report.json wholesale; use fixed-vocabulary reasons. Recommendations reference the exact rule/catalog revision, never duplicate thresholds. Implemented as `serverq projection` (fields and reason vocabulary: [serverq.md § 3](../../serverq.md#3-check-and-report)); delivery through coreq is pending.
 
 A fresh connection may expose an old report as stale; it cannot rerun or repair checks remotely. No implied cross-product host/filesystem join. Historical findings research supplies context, not additional approved features.
 
