@@ -1,4 +1,4 @@
-# serverq.md § 4 Release: one static Linux binary per arch, SHA256SUMS, latest.json. A failing selftest publishes nothing.
+# serverq.md § 4 Release: one static Linux binary per arch, a Windows binary (§ 7), SHA256SUMS, latest.json. A failing selftest publishes nothing.
 name: release
 on:
   push:
@@ -12,15 +12,28 @@ jobs:
         include:
           - os: ubuntu-latest
             arch: x86_64
+            target: x86_64-unknown-linux-musl
+            name: linux-x86_64
           - os: ubuntu-24.04-arm
             arch: aarch64
+            target: aarch64-unknown-linux-musl
+            name: linux-aarch64
+          - os: windows-latest
+            arch: x86_64
+            target: x86_64-pc-windows-msvc
+            name: windows-x86_64
+            ext: .exe
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
     env:
       SERVERQ_SELFTEST_OFFLINE: '1'
-      TARGET: ${{ matrix.arch }}-unknown-linux-musl
+      TARGET: ${{ matrix.target }}
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: rustup update stable --no-self-update && rustup default stable && rustup target add "$TARGET"
       - name: Version from tag
         run: |
@@ -32,14 +45,14 @@ jobs:
       - run: cargo build --release --target "$TARGET"
       - name: Selftest and stage
         run: |
-          bin="target/$TARGET/release/serverq"
-          file "$bin" | grep -Eq 'static(ally|-pie) linked'
+          bin="target/$TARGET/release/serverq${{ matrix.ext }}"
+          [ "$RUNNER_OS" != Linux ] || file "$bin" | grep -Eq 'static(ally|-pie) linked'
           "$bin" selftest
           mkdir dist
-          cp "$bin" "dist/serverq-$VER-linux-${{ matrix.arch }}"
+          cp "$bin" "dist/serverq-$VER-${{ matrix.name }}${{ matrix.ext }}"
       - uses: actions/upload-artifact@v4
         with:
-          name: linux-${{ matrix.arch }}
+          name: ${{ matrix.name }}
           path: dist/*
   publish:
     needs: build
@@ -59,8 +72,8 @@ jobs:
           python3 - "$ver" <<'PY'
           import json, os, sys
           ver = sys.argv[1]
-          files = {n[len(f'serverq-{ver}-'):]: n for n in sorted(os.listdir('.')) if n.startswith(f'serverq-{ver}-')}
-          assert set(files) == {'linux-x86_64', 'linux-aarch64'}, files
+          files = {n[len(f'serverq-{ver}-'):].removesuffix('.exe'): n for n in sorted(os.listdir('.')) if n.startswith(f'serverq-{ver}-')}
+          assert set(files) == {'linux-x86_64', 'linux-aarch64', 'windows-x86_64'}, files
           json.dump({'version': ver, 'files': files}, open('latest.json', 'w'), indent=1)
           PY
       - name: Publish

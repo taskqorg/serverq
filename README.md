@@ -1,6 +1,6 @@
 # ServerQ
 
-Minimal server-care recommendations and a stateful read-only Linux checker for AI agents: one static binary that checks hourly and updates itself daily.
+Minimal server-care recommendations and a stateful read-only Linux checker for AI agents (Windows hosts run it with Linux-only rules unknown): one static binary that checks hourly and updates itself daily.
 
 Author: Tight <tight@kirs.online>.
 
@@ -27,6 +27,21 @@ chmod +x "serverq-$ver-linux-$arch" && "./serverq-$ver-linux-$arch" service inst
 ```
 
 `service install` moves a legacy `~/.serverq` (serverq.md § 6): it stops the four Python units, copies state and report, keeps the old folder as `~/.local/share/serverq/legacy` and links `~/.serverq` to the new folder, then starts `serverq.service` and runs one check. It prints every step and the exact rollback. A host that must check without a login session needs `loginctl enable-linger <user>`.
+
+## Windows
+
+A Windows host runs the same hourly check and daily update as a Scheduled Task; every Linux-only rule reads `unknown` with `reason: unsupported-os`, so `check` exits 2 (serverq.md § 7). From a normal, non-elevated PowerShell:
+
+```powershell
+$base = "https://github.com/taskqorg/serverq/releases/latest/download"
+$ver = (Invoke-RestMethod "$base/latest.json").version
+Invoke-WebRequest "$base/serverq-$ver-windows-x86_64.exe" -OutFile serverq.exe
+Invoke-WebRequest "$base/SHA256SUMS" -OutFile SHA256SUMS
+(Get-FileHash serverq.exe -Algorithm SHA256).Hash   # compare with the line in SHA256SUMS
+.\serverq.exe service install
+```
+
+The install folder is `%LOCALAPPDATA%\serverq`; service output goes to `serverq.log` there. Register the task from the account that runs it: a task registered elevated cannot be replaced or removed without elevation.
 
 ## Use
 

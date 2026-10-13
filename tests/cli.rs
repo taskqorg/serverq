@@ -35,6 +35,14 @@ fn real_cli_isolated_state_and_failure() {
         assert_eq!(second["results"]["bounded-journal"]["cached"], true);
         assert_eq!(report(&check(&home, &["--force"]))["results"]["bounded-journal"]["cached"], false);
     }
+    // serverq.md § 7: a Linux-only probe elsewhere is unknown with its reason, never ok, and exits 2
+    let linux_only: &[&str] = if cfg!(windows) { &RESULTS } else { &RESULTS[2..] };
+    if !cfg!(target_os = "linux") {
+        assert_eq!(first.status.code(), Some(2));
+        for k in linux_only {
+            assert_eq!((r["results"][k]["status"].as_str(), r["results"][k]["reason"].as_str()), (Some("unknown"), Some("unsupported-os")), "{k}");
+        }
+    }
     let missing = check(&home, &["--filesystem", home.join("absent").to_str().unwrap()]);
     assert_eq!(missing.status.code(), Some(2));
     assert_eq!(report(&missing)["results"]["disk-headroom"]["status"], "unknown");
@@ -62,23 +70,22 @@ fn bad_arguments_are_errors() {
     assert_eq!(Command::new(env!("CARGO_BIN_EXE_serverq")).output().unwrap().status.code(), Some(2));
 }
 
+#[cfg(target_os = "linux")]
 fn write_exe(p: &Path, text: &str) {
     use std::os::unix::fs::PermissionsExt;
     fs::write(p, text).unwrap();
     fs::set_permissions(p, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+#[cfg(target_os = "linux")]
 fn text(p: impl AsRef<Path>) -> String {
     fs::read_to_string(p).unwrap_or_default().trim().to_string()
 }
 
 /// serverq.md § 5, § 6 and § 4 against a fake legacy folder, a fake `systemctl` and a fake release served by a fake `curl`.
+#[cfg(target_os = "linux")]
 #[test]
 fn service_install_migrates_runs_updates_and_rolls_back() {
-    if !cfg!(target_os = "linux") {
-        eprintln!("the service is Linux only; skipped");
-        return;
-    }
     let d = scratch("service");
     let (home, bin, rel, log) = (d.join("h"), d.join("bin"), d.join("rel"), d.join("systemctl.log"));
     let install = home.join(".local/share/serverq");
