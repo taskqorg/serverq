@@ -1,0 +1,9 @@
+{
+  "board": "github",
+  "repo": "taskqorg/serverq",
+  "publish": "pr",
+  "limits": {
+    "claude": 4,
+    "codex": 4
+  }
+}
