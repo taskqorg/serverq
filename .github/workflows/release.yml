@@ -33,7 +33,7 @@ jobs:
       - name: Selftest and stage
         run: |
           bin="target/$TARGET/release/serverq"
-          file "$bin" | grep -q 'statically linked'
+          file "$bin" | grep -Eq 'static(ally|-pie) linked'
           "$bin" selftest
           mkdir dist
           cp "$bin" "dist/serverq-$VER-linux-${{ matrix.arch }}"

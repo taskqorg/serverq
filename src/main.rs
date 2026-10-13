@@ -83,7 +83,10 @@ fn check(home: &Path, filesystem: &str, force: bool) -> Result<(i32, Value), Str
 /// A check in a temporary install that names every automated rule; host health does not decide the outcome.
 fn selftest() -> Result<i32, String> {
     let rules: Obj = serde_json::from_slice(RULES).map_err(|e| format!("rules.json: {e}"))?;
-    let dir = std::env::temp_dir().join(format!("serverq-selftest-{}", std::process::id()));
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.subsec_nanos());
+    let dir = std::env::temp_dir().join(format!("serverq-selftest-{}-{nanos}", std::process::id()));
+    // a fresh 0700 folder: an existing path or a planted link fails instead of being written through
+    fs::DirBuilder::new().mode(0o700).create(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let result = check(&dir, "/", true);
     let _ = fs::remove_dir_all(&dir);
     let (code, report) = result?;
