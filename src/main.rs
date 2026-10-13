@@ -3,6 +3,7 @@ use serde_json::{Map, Value, json};
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -14,8 +15,34 @@ const DOCKER: [&str; 3] = ["docker", "--host", "unix:///var/run/docker.sock"];
 const USAGE: &str = "usage: serverq check [--force] [--filesystem PATH] | rules | update | rollback | selftest | service install|run|pause|resume|status|restart|stop|uninstall; every command takes --home PATH";
 const UNIT: &str = "serverq.service";
 const LEGACY_UNITS: [&str; 4] = ["serverq-check.timer", "serverq-update.timer", "serverq-check.service", "serverq-update.service"];
+const LINUX: bool = cfg!(target_os = "linux");
+const UNSUPPORTED: &str = "unsupported-os";
+/// coreq's Windows unit for project `serverq`: `<title>-<project>`.
+const TASK: &str = "ServerQ-serverq";
 
 type Obj = Map<String, Value>;
+
+/// Windows has no Unix modes: the install folder under `%LOCALAPPDATA%` keeps the user's ACL (serverq.md § 7).
+#[cfg(windows)]
+trait Mode {
+    fn mode(&mut self, _: u32) -> &mut Self {
+        self
+    }
+}
+#[cfg(windows)]
+impl Mode for fs::DirBuilder {}
+#[cfg(windows)]
+impl Mode for OpenOptions {}
+
+fn private(p: &Path, mode: u32) -> std::io::Result<()> {
+    #[cfg(unix)]
+    return fs::set_permissions(p, fs::Permissions::from_mode(mode));
+    #[cfg(windows)]
+    {
+        let _ = (p, mode);
+        Ok(())
+    }
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -34,7 +61,7 @@ fn run(args: &[String]) -> Result<i32, String> {
     }
     // the launcher copy only picks the release to run, before parsing: a newer release may take new arguments (coreq.md § Launcher)
     let me = std::env::current_exe().and_then(fs::canonicalize).ok();
-    if me.is_some() && me == fs::canonicalize(t.install.join("serverq")).ok() {
+    if me.is_some() && me == fs::canonicalize(t.install.join(t.exe_name())).ok() {
         coreq::launcher::launch(&t, args);
     }
     let (mut words, mut filesystem, mut force) = (vec![], "/".to_string(), false);
@@ -110,7 +137,7 @@ fn rollback(t: &coreq::Tool) -> Result<i32, String> {
     fs::write(t.install.join("paused"), "").map_err(|e| e.to_string())?;
     println!("serverq: rolled back from {cur} to {prev}; updates paused until `serverq service resume`");
     if unit(t).path.exists() {
-        systemctl(&["restart", UNIT])?;
+        restart(t)?;
     }
     Ok(0)
 }
@@ -125,18 +152,29 @@ fn service(t: &coreq::Tool, cmd: &str) -> Result<i32, String> {
         },
         "status" => return service_status(t),
         "run" => return serve(t),
-        _ if !cfg!(target_os = "linux") => return Err("the service is Linux only (serverq.md § 7)".into()),
+        _ if !LINUX && !cfg!(windows) => return Err("the service is Linux and Windows only (serverq.md § 7)".into()),
+        "install" if cfg!(windows) => return install_task(t),
         "install" => return install(t),
-        "restart" | "stop" => systemctl(&[cmd, UNIT])?,
+        "restart" => restart(t)?,
+        "stop" => end(t)?,
         "uninstall" => {
             let u = unit(t);
+            if cfg!(windows) {
+                end(t)?;
+            }
             coreq::service::run_all(&u.unload, true)?;
+            // a task this user may not delete (registered elevated) must not read as uninstalled
+            if cfg!(windows) && coreq::quiet(Command::new("schtasks").args(["/Query", "/TN", TASK]).stdout(Stdio::null()).stderr(Stdio::null())).status().is_ok_and(|s| s.success()) {
+                return Err(format!("Scheduled Task {TASK} is still registered; delete it from the account that registered it"));
+            }
             if let Err(e) = fs::remove_file(&u.path)
                 && e.kind() != std::io::ErrorKind::NotFound
             {
                 return Err(format!("{}: {e}", u.path.display()));
             }
-            systemctl(&["daemon-reload"])?;
+            if LINUX {
+                systemctl(&["daemon-reload"])?;
+            }
         }
         _ => return Err(USAGE.into()),
     }
@@ -148,8 +186,59 @@ fn systemctl(args: &[&str]) -> Result<(), String> {
     coreq::service::run_all(&[[&["systemctl", "--user"][..], args].concat().iter().map(|s| s.to_string()).collect()], false)
 }
 
-/// The one user unit; it keeps the Python units' resource caps and sandbox.
+fn restart(t: &coreq::Tool) -> Result<(), String> {
+    if !cfg!(windows) {
+        return systemctl(&["restart", UNIT]);
+    }
+    end(t)?;
+    coreq::service::run_all(&unit(t).load[1..], false)
+}
+
+/// Stops the service until the next logon. Windows: `schtasks /End` ends only the launcher, so every other
+/// `serverq.exe` of the install folder goes too, except this process and the launcher running it (coreq.md § Service units).
+fn end(t: &coreq::Tool) -> Result<(), String> {
+    if !cfg!(windows) {
+        return systemctl(&["stop", UNIT]);
+    }
+    coreq::service::run_all(&unit(t).stop, true)?;
+    // ponytail: PowerShell CIM, the one stock tool that lists processes with their paths; no double quotes, which the
+    // Windows command line would mangle
+    let script = format!(
+        "$me = {pid}; $up = (Get-CimInstance Win32_Process -Filter ('ProcessId=' + $me)).ParentProcessId; \
+         $mine = {{ Get-CimInstance Win32_Process -Filter 'Name=''serverq.exe''' | \
+         Where-Object {{ $_.ProcessId -notin @($me, $up) -and ([string]$_.ExecutablePath).StartsWith('{dir}\\', 'OrdinalIgnoreCase') }} }}; \
+         & $mine | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue; 'ended ' + $_.ProcessId + ' ' + $_.ExecutablePath }}; \
+         if (& $mine) {{ 'serverq processes of the install folder survived'; exit 1 }}",
+        pid = std::process::id(),
+        dir = t.install.display().to_string().replace('\'', "''")
+    );
+    coreq::service::run_all(&[["powershell", "-NoProfile", "-NonInteractive", "-Command", &script].map(String::from).to_vec()], false)
+}
+
+/// Windows: coreq's Scheduled Task `TASK` at this user's logon, no admin. It runs `service run` without
+/// arguments, so only the default install folder can be the service's.
+fn install_task(t: &coreq::Tool) -> Result<i32, String> {
+    if t.install != coreq::Tool::new("serverq", "ServerQ", "taskqorg/serverq", VERSION).install {
+        return Err("the Scheduled Task uses the default install folder; drop --home".into());
+    }
+    // a running launcher or service locks its exe against the copy below
+    end(t)?;
+    coreq::update::install_self(t)?;
+    println!("installed serverq {VERSION} as {}", t.install.join(t.exe_name()).display());
+    let u = unit(t);
+    coreq::service::write_unit(&u)?;
+    coreq::service::run_all(&u.load, false)?;
+    println!("started Scheduled Task from {}", u.path.display());
+    let (code, _) = check(&t.install, "/", false)?;
+    println!("check exit {code}, report {}", t.install.join("report.json").display());
+    Ok(0)
+}
+
+/// The one user unit; on Linux it keeps the Python units' resource caps and sandbox.
 fn unit(t: &coreq::Tool) -> coreq::service::Unit {
+    if cfg!(windows) {
+        return coreq::service::unit(t, &t.install, "serverq");
+    }
     let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
     let i = t.install.display();
     let path_env = std::env::var("PATH").unwrap_or_default();
@@ -230,7 +319,11 @@ fn migrate(t: &coreq::Tool, legacy: &Path) -> Result<File, String> {
     println!("4. state.json and report.json copied into {}", t.install.display());
     let moved = t.install.join("legacy");
     fs::rename(legacy, &moved).map_err(|e| restore(format!("move {}: {e}", legacy.display())))?;
-    if let Err(e) = std::os::unix::fs::symlink(&t.install, legacy) {
+    #[cfg(unix)]
+    let linked = std::os::unix::fs::symlink(&t.install, legacy);
+    #[cfg(windows)]
+    let linked: std::io::Result<()> = Err(std::io::ErrorKind::Unsupported.into());
+    if let Err(e) = linked {
         let _ = fs::rename(&moved, legacy);
         return Err(restore(format!("link {}: {e}", legacy.display())));
     }
@@ -247,7 +340,11 @@ fn serve(t: &coreq::Tool) -> Result<i32, String> {
     let (check_every, update_every) = (every("SERVERQ_CHECK_EVERY", 3600), every("SERVERQ_UPDATE_EVERY", 86400));
     let start = Instant::now();
     let (mut next_check, mut next_update) = (start + check_every.min(Duration::from_secs(300)), start + update_every.min(Duration::from_secs(900)));
-    let host = fs::read_to_string("/proc/sys/kernel/hostname").or_else(|_| fs::read_to_string("/etc/hostname")).map(|h| h.trim().to_string()).unwrap_or_default();
+    let host = fs::read_to_string("/proc/sys/kernel/hostname")
+        .or_else(|_| fs::read_to_string("/etc/hostname"))
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .map(|h| h.trim().to_string())
+        .unwrap_or_default();
     let (mut check_status, mut update_at, mut check_error, mut update_error): (Value, Value, Option<String>, Option<String>) = (Value::Null, Value::Null, None, None);
     // the launcher runs `releases/<ver>/serverq`; a first completed check marks that release healthy
     let healthy = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("healthy"))).filter(|h| h.parent().and_then(Path::parent) == Some(&t.install.join("releases")));
@@ -335,11 +432,15 @@ fn service_status(t: &coreq::Tool) -> Result<i32, String> {
 fn lock(home: &Path) -> Result<File, String> {
     let e = |e: std::io::Error| format!("{}: {e}", home.display());
     fs::DirBuilder::new().recursive(true).mode(0o700).create(home).map_err(e)?;
-    fs::set_permissions(home, fs::Permissions::from_mode(0o700)).map_err(e)?;
+    private(home, 0o700).map_err(e)?;
     let p = home.join("lock");
-    let f = OpenOptions::new().append(true).create(true).mode(0o600).open(&p).map_err(e)?;
-    fs::set_permissions(&p, fs::Permissions::from_mode(0o600)).map_err(e)?;
-    f.try_lock().map_err(|_| "serverq is already running; check was not started")?;
+    // write, not append: Windows locks only a handle with write access
+    let f = OpenOptions::new().write(true).create(true).truncate(false).mode(0o600).open(&p).map_err(e)?;
+    private(&p, 0o600).map_err(e)?;
+    f.try_lock().map_err(|err| match err {
+        fs::TryLockError::WouldBlock => "serverq is already running; check was not started".to_string(),
+        fs::TryLockError::Error(err) => format!("{}: {err}", p.display()),
+    })?;
     Ok(f)
 }
 
@@ -360,10 +461,30 @@ fn audit(home: &Path, filesystem: &str, force: bool) -> Result<Value, String> {
         }
         Err(e) => {
             for k in ["disk-headroom", "inode-headroom"] {
-                results.insert(k.into(), unknown(format!("Filesystem collection failed: {e}")));
+                results.insert(k.into(), if e == UNSUPPORTED { unsupported() } else { unknown(format!("Filesystem collection failed: {e}")) });
             }
         }
     }
+    if !LINUX {
+        for k in ["failed-services", "bounded-docker-logs", "bounded-journal"] {
+            results.insert(k.into(), unsupported());
+        }
+    } else {
+        linux_probes(&mut state, &mut results, now, &number)?;
+    }
+    incidents(&mut state, &results, now)?;
+    let manual: Vec<&String> = rules.iter().filter(|(_, r)| r["manual"] == true).map(|(k, _)| k).collect();
+    let report = json!({"schema": 1, "at": now, "revision": revision, "filesystem": filesystem, "results": results,
+        "incidents": state.get("incidents").cloned().unwrap_or(json!({})), "manual_rules": manual});
+    state.insert("revision".into(), revision.into());
+    state.insert("last_run".into(), now.into());
+    save_json(&home.join("state.json"), &state.into())?;
+    save_json(&home.join("report.json"), &report)?;
+    Ok(report)
+}
+
+/// systemd and the system Docker socket exist only on Linux.
+fn linux_probes(state: &mut Obj, results: &mut Obj, now: f64, number: &dyn Fn(&str, &str) -> Result<f64, String>) -> Result<(), String> {
     results.insert("failed-services".into(), failed_units(command(&["systemctl", "--failed", "--no-legend", "--plain", "--no-pager"])));
     results.insert("bounded-docker-logs".into(), docker_logs(which("docker"), Path::new("/var/run/docker.sock").exists(), &mut |a| command(a)));
     let journal = match journal_fingerprint() {
@@ -378,19 +499,16 @@ fn audit(home: &Path, filesystem: &str, force: bool) -> Result<Value, String> {
         Err(e) => unknown(format!("Journal config unavailable: {e}")),
     };
     results.insert("bounded-journal".into(), journal);
-    incidents(&mut state, &results, now)?;
-    let manual: Vec<&String> = rules.iter().filter(|(_, r)| r["manual"] == true).map(|(k, _)| k).collect();
-    let report = json!({"schema": 1, "at": now, "revision": revision, "filesystem": filesystem, "results": results,
-        "incidents": state.get("incidents").cloned().unwrap_or(json!({})), "manual_rules": manual});
-    state.insert("revision".into(), revision.into());
-    state.insert("last_run".into(), now.into());
-    save_json(&home.join("state.json"), &state.into())?;
-    save_json(&home.join("report.json"), &report)?;
-    Ok(report)
+    Ok(())
 }
 
 fn unknown(detail: String) -> Value {
     json!({"status": "unknown", "detail": detail})
+}
+
+/// A Linux-only probe on another OS: unknown, never `ok` (serverq.md § 7).
+fn unsupported() -> Value {
+    json!({"status": "unknown", "detail": format!("{UNSUPPORTED}: Linux-only probe on {}", std::env::consts::OS), "reason": UNSUPPORTED})
 }
 
 fn capacity(total: u64, available: u64, minimum: f64) -> Value {
@@ -402,7 +520,14 @@ fn capacity(total: u64, available: u64, minimum: f64) -> Value {
         "available": available, "total": total})
 }
 
+/// Windows has no inodes; its disk probe is a later task (serverq.md § 7).
+#[cfg(windows)]
+fn statvfs(_: &str) -> Result<[u64; 4], String> {
+    Err(UNSUPPORTED.into())
+}
+
 /// `[total bytes, free bytes, inodes, free inodes]` as `shutil.disk_usage` and `os.statvfs` report them.
+#[cfg(unix)]
 fn statvfs(path: &str) -> Result<[u64; 4], String> {
     let c = std::ffi::CString::new(path).map_err(|_| "InvalidPath")?;
     let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
@@ -444,8 +569,15 @@ fn command(argv: &[&str]) -> Result<String, String> {
     String::from_utf8(buf).map_err(|_| fail("invalid UTF-8".into()))
 }
 
+/// Only Linux probes look a program up.
+#[cfg(unix)]
 fn which(name: &str) -> bool {
     std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| fs::metadata(d.join(name)).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)))
+}
+
+#[cfg(windows)]
+fn which(_: &str) -> bool {
+    false
 }
 
 fn failed_units(output: Result<String, String>) -> Value {
@@ -629,13 +761,17 @@ fn save_json(path: &Path, value: &Value) -> Result<(), String> {
     let dir = path.parent().unwrap_or(Path::new("."));
     let tmp = dir.join(format!(".serverq-{}-{}", std::process::id(), path.file_name().and_then(|n| n.to_str()).unwrap_or("tmp")));
     let _ = fs::remove_file(&tmp);
-    let r = (|| {
+    let r = (|| -> std::io::Result<()> {
         fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
         let mut f = OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)?;
         f.write_all(format!("{}\n", pretty(value)).as_bytes())?;
         f.sync_all()?;
         fs::rename(&tmp, path)?;
-        File::open(dir)?.sync_all()
+        // Windows cannot open a folder as a file; NTFS journals the rename
+        if cfg!(unix) {
+            File::open(dir)?.sync_all()?;
+        }
+        Ok(())
     })();
     if r.is_err() {
         let _ = fs::remove_file(&tmp);
@@ -739,6 +875,7 @@ mod tests {
         let path = scratch("state").join("state.json");
         save_json(&path, &json!({"schema": 1})).unwrap();
         assert_eq!(load_state(&path).unwrap()["schema"], 1);
+        #[cfg(unix)]
         assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         for broken in ["broken", "[]", r#"{"schema": 2}"#, r#"{"schema": 1, "cache": []}"#] {
             fs::write(&path, broken).unwrap();
@@ -751,6 +888,7 @@ mod tests {
     fn command_error_not_healthy() {
         assert_eq!(status(&failed_units(command(&["serverq-no-such-command"]))), "unknown");
         assert_eq!(status(&failed_units(command(&["false"]))), "unknown");
+        #[cfg(unix)]
         assert_eq!(command(&["echo", "x"]), Ok("x\n".into()));
         let found = failed_units(Ok("a.service loaded failed failed A\n\nb.service loaded failed failed B\n".into()));
         assert_eq!((status(&found), &found["units"]), ("warn", &json!(["a.service", "b.service"])));
@@ -819,6 +957,14 @@ mod tests {
         assert_eq!(state["incidents"]["disk-headroom"]["first_seen"], 104.0);
         state["incidents"]["disk-headroom"] = json!({"occurrences": 1});
         assert!(incidents(&mut state, &at("warn"), 105.0).is_err(), "corrupt incident is an error");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_unit_is_the_task_restart_runs() {
+        let u = unit(&coreq::Tool::new("serverq", "ServerQ", "taskqorg/serverq", VERSION));
+        assert_eq!(u.load[1], ["schtasks", "/Run", "/TN", TASK]);
+        assert_eq!(u.stop, [["schtasks", "/End", "/TN", TASK]]);
     }
 
     #[test]

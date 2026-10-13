@@ -50,7 +50,7 @@ Checks, in the order of `rules.json`:
 
 coreq owns all of it; serverq passes tool name `serverq`, install folder and release repository `taskqorg/serverq` as parameters.
 
-- Release: CI on a `v*` tag builds `serverq-<ver>-linux-<arch>` for `x86_64` and `aarch64`, `SHA256SUMS` and `latest.json`. Each artifact passes `selftest` before publishing. One static binary: hosts need no Python, git or toolchain.
+- Release: CI on a `v*` tag builds `serverq-<ver>-linux-<arch>` for `x86_64` and `aarch64` and `serverq-<ver>-windows-x86_64.exe` (§ 7), `SHA256SUMS` and `latest.json`. Each artifact passes `selftest` before publishing. One static binary: hosts need no Python, git or toolchain.
 - Install folder `~/.local/share/serverq` (`<install>`): immutable `releases/<ver>/`, `current`, `previous`, the launcher `<install>/serverq`, `status.json`, `paused`, plus serverq's `report.json`, `state.json`, `lock`. The repository keeps version `1.0.0-dev`; the tag sets the release version, so a build from a branch is older than any release.
 - Update: coreq steps (read `latest.json`, download into `releases/<ver>.tmp/`, verify sha256, `selftest`, swap `current`). Old release folders stay.
 - Rollback: the launcher restores `previous` after three `service run` starts of a version that never wrote `releases/<ver>/healthy`; `service run` writes it after its first completed check. A manual `rollback` writes `previous` into `current`, swaps them, pauses updates and restarts an installed service; `service resume` returns to normal updates. coreq never reinstalls a version whose folder exists, so a rolled-back release returns only with a newer one.
@@ -69,7 +69,7 @@ Dropped from the Python version, because coreq covers them:
 
 One OS unit replaces `serverq-check.service`, `serverq-check.timer`, `serverq-update.service` and `serverq-update.timer`.
 
-- `serverq service install` copies the running binary in as coreq `install_self` (current release and launcher), then writes `~/.config/systemd/user/serverq.service` running `<install>/serverq service run --home <install>` with `Restart=always`, `RestartSec=10`, and loads it with `daemon-reload` and `enable --now`. serverq has one unit per host, not one per project, so it fills coreq's `Unit` itself instead of coreq's `<name>-<project>` unit. Linux only; another OS is an error. A host that must check without a login session needs `loginctl enable-linger <user>` (an operator step; serverq does not run it).
+- `serverq service install` copies the running binary in as coreq `install_self` (current release and launcher), then writes `~/.config/systemd/user/serverq.service` running `<install>/serverq service run --home <install>` with `Restart=always`, `RestartSec=10`, and loads it with `daemon-reload` and `enable --now`. serverq has one unit per host, not one per project, so it fills coreq's `Unit` itself instead of coreq's `<name>-<project>` unit. Windows: § 7. Another OS is an error. A host that must check without a login session needs `loginctl enable-linger <user>` (an operator step; serverq does not run it).
 - The unit keeps the Python resource caps and sandbox: `UMask=0077`, `NoNewPrivileges=yes`, `PrivateTmp=yes`, `ProtectSystem=strict`, `ReadWritePaths=<install>`, `MemoryMax=128M`, `TasksMax=32`.
 - `service run` loop: a check 5 min after start, then every `check_every` (3600 s); the coreq update check 15 min after start, then every `update_every` (86400 s). Env `SERVERQ_CHECK_EVERY` and `SERVERQ_UPDATE_EVERY` (seconds) override the periods for tests; each first pass waits at most its period. One loop: a check and an update never overlap. A check result 1 is a normal pass, not a service failure. An installed update exits 75 and systemd starts the new `current`. Each pass prints one line to the journal.
 - `pause` writes `<install>/paused` and stops updates only; checks continue, since stopping them would hide deviations. `resume` removes it. `restart`, `stop` and `uninstall` run `systemctl --user restart`, `stop` and `disable --now`; `uninstall` also deletes the unit file, never the install folder.
@@ -92,10 +92,17 @@ Once per host, by `serverq service install` from the downloaded binary. The lega
 - A second install finds the link and does not migrate. `pin.json`, `update.json` and `versions/` stay in `legacy/` unread.
 - The cutover deletes `serverq.py`, `tools/`, `systemd/`, `release.json` and the Python tests in the same deliverable that ships v1.0.0; the last Python release stays downloadable.
 
-## 7. Windows, later
+## 7. Windows
 
-Not built in v1. A later task adds `serverq-<ver>-windows-<arch>`, the coreq Scheduled Task unit and Windows probes, and amends § 3 per rule. Until then a Linux-only probe on another OS is `unknown`, never `ok`.
+A Windows host runs the service and reports the Linux-only rules as unknown; Windows probes are a later task.
+
+- Release: `serverq-<ver>-windows-x86_64.exe`, built and selftested like the Linux artifacts. Install folder `%LOCALAPPDATA%\serverq` (coreq default).
+- `service install` ends a running task first (Windows locks a running exe), copies the binary in as on Linux, then registers coreq's Scheduled Task `ServerQ-serverq` from `<install>/ServerQ-serverq.xml`: this user's logon, `LeastPrivilege`, no admin, launcher supervision and `<install>/serverq.log` per coreq.md. It runs `service run` without arguments, so `--home` other than the default is an error. The loop, `status.json` (`host` from `COMPUTERNAME`) and `service status` are § 5.
+- `schtasks /End` ends only the launcher, so `stop`, `restart` (then `/Run`), `uninstall` and a reinstall also end every other `serverq.exe` running from the install folder, except the caller and its launcher. `uninstall` deletes the task, failing when this user may not (a task registered elevated), and its XML, never the install folder.
+- Check: every rule whose probe is Linux-only is `unknown` with `reason: unsupported-os`, never `ok`, so `check` exits 2. On Windows that is all five automated rules (no `statvfs`, systemd or system Docker socket); on macOS the three systemd and Docker rules. `report.json` adds `reason` to those results only.
+- Files: no Unix modes or folder fsync; the install folder keeps the user's ACL. The lock opens with write access, which Windows needs to lock it.
+- dashq shows the host once hosts push `status.json` (dashq #4); serverq adds no own channel.
 
 ## 8. Checks
 
-`cargo test --locked`, then `serverq selftest`, then `serverq check --home <temp>` on the authorized host. Tests cover each rule's `ok`/`warn`/`unknown`, cache hit, TTL and revision invalidation, corrupt state, exit codes, the migration steps against a fake legacy folder, and update then rollback against a fake release served by a fake `curl`. Linux-only service tests skip elsewhere.
+`cargo test --locked`, then `serverq selftest`, then `serverq check --home <temp>` on the authorized host. Tests cover each rule's `ok`/`warn`/`unknown`, cache hit, TTL and revision invalidation, corrupt state, exit codes, the migration steps against a fake legacy folder, and update then rollback against a fake release served by a fake `curl`. Linux-only service tests compile only on Linux; on other OSes the CLI test asserts `unsupported-os`. CI runs the tests on Linux and Windows; the Scheduled Task is verified on the authorized Windows host.
