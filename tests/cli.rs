@@ -157,10 +157,14 @@ fn service_install_migrates_runs_updates_and_rolls_back() {
     assert!(!install.join("releases/1.0.1").exists() && !install.join("releases/1.0.1.tmp").exists());
     let sums = Command::new("sha256sum").arg(&asset).current_dir(&rel).output().unwrap().stdout;
     fs::write(rel.join("SHA256SUMS"), sums).unwrap();
+    fs::create_dir_all(install.join("releases/0.9.0")).unwrap();
     let updated = run(&launcher, &["update"]);
     assert!(updated.status.success(), "{}", String::from_utf8_lossy(&updated.stderr));
     assert_eq!((text(install.join("current")), text(install.join("previous"))), ("1.0.1".into(), version.into()));
     assert!(install.join("releases/1.0.1/serverq").exists());
+    let mut kept: Vec<_> = fs::read_dir(install.join("releases")).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+    kept.sort();
+    assert_eq!(kept, [version.to_string(), "1.0.1".into()], "an update prunes releases to current and previous");
     fs::remove_file(&log).unwrap();
     assert!(run(&launcher, &["rollback"]).status.success());
     assert_eq!((text(install.join("current")), text(install.join("previous"))), (version.into(), "1.0.1".into()));
