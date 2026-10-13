@@ -21,6 +21,7 @@ stage=$(mktemp -d) && cd "$stage"
 ver=$(curl -fsSL "$base/latest.json" | sed -n 's/.*"version": *"\([^"]*\)".*/\1/p')
 curl -fsSL -O "$base/serverq-$ver-linux-$arch" -O "$base/SHA256SUMS"
 sha256sum --check --ignore-missing SHA256SUMS
+gh attestation verify "serverq-$ver-linux-$arch" --repo taskqorg/serverq   # optional: provenance, needs gh
 chmod +x "serverq-$ver-linux-$arch" && "./serverq-$ver-linux-$arch" service install
 ```
 
@@ -36,6 +37,7 @@ $ver = (Invoke-RestMethod "$base/latest.json").version
 Invoke-WebRequest "$base/serverq-$ver-windows-x86_64.exe" -OutFile serverq.exe
 Invoke-WebRequest "$base/SHA256SUMS" -OutFile SHA256SUMS
 (Get-FileHash serverq.exe -Algorithm SHA256).Hash   # compare with the line in SHA256SUMS
+gh attestation verify serverq.exe --repo taskqorg/serverq   # optional: provenance, needs gh
 .\serverq.exe service install
 ```
 

@@ -1,4 +1,4 @@
-# serverq.md § 4 Release: one static Linux binary per arch, a Windows binary (§ 7), SHA256SUMS, latest.json. A failing selftest publishes nothing.
+# serverq.md § 4 Release: one static Linux binary per arch, a Windows binary (§ 7), SHA256SUMS, latest.json, a build provenance attestation per binary and SHA256SUMS. A failing selftest publishes nothing.
 name: release
 on:
   push:
@@ -54,11 +54,12 @@ jobs:
         with:
           name: ${{ matrix.name }}
           path: dist/*
-  publish:
+  attest:
     needs: build
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -76,6 +77,25 @@ jobs:
           assert set(files) == {'linux-x86_64', 'linux-aarch64', 'windows-x86_64'}, files
           json.dump({'version': ver, 'files': files}, open('latest.json', 'w'), indent=1)
           PY
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/serverq-*
+            dist/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release
+          path: dist/*
+  publish:
+    needs: attest
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release
+          path: dist
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
