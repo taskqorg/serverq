@@ -77,6 +77,19 @@ fn bad_arguments_are_errors() {
     assert_eq!(Command::new(env!("CARGO_BIN_EXE_serverq")).output().unwrap().status.code(), Some(2));
 }
 
+/// serverq.md § 2: a never-enrolled install has no connection and refuses a non-HTTPS destination.
+#[test]
+fn connection_commands_without_enrollment() {
+    let home = scratch("connection");
+    let run = |args: &[&str]| Command::new(env!("CARGO_BIN_EXE_serverq")).args(args).arg("--home").arg(&home).output().unwrap();
+    let status = run(&["connection", "status"]);
+    assert_eq!((status.status.code(), String::from_utf8_lossy(&status.stdout).trim()), (Some(0), "Connection: none"));
+    assert_eq!(run(&["disconnect"]).status.code(), Some(0));
+    let bad = run(&["enroll", "http://dash.example", "--headless"]);
+    assert_eq!(bad.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&bad.stderr).contains("destination must be https"));
+}
+
 #[cfg(target_os = "linux")]
 fn write_exe(p: &Path, text: &str) {
     use std::os::unix::fs::PermissionsExt;
