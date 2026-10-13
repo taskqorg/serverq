@@ -1,0 +1,11 @@
+[package]
+name = "serverq"
+version = "1.0.0-dev"
+edition = "2024"
+publish = false
+
+[dependencies]
+coreq = { git = "https://github.com/taskqorg/coreq", tag = "v0.1.0" }
+libc = "0.2"
+ring = "0.17"
+serde_json = { version = "1", features = ["preserve_order"] }

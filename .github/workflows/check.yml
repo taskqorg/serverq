@@ -13,3 +13,8 @@ jobs:
       - run: |
           python tools/package_release.py --output /tmp/serverq-dist
           python -c 'import json,pathlib; v=json.load(open("release.json"))["version"]; p=pathlib.Path("/tmp/serverq-dist"); assert (p/f"serverq-{v}.zip").is_file() and (p/f"serverq-{v}.manifest.json").is_file()'
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup update stable --no-self-update && cargo test --locked
