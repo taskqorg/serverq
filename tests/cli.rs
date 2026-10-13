@@ -160,7 +160,7 @@ fn service_install_migrates_runs_updates_and_rolls_back() {
     assert!(!install.join("releases").join(&next).exists() && !install.join("releases").join(format!("{next}.tmp")).exists());
     let sums = Command::new("sha256sum").arg(&asset).current_dir(&rel).output().unwrap().stdout;
     fs::write(rel.join("SHA256SUMS"), sums).unwrap();
-    fs::create_dir_all(install.join("releases/0.9.0")).unwrap();
+    fs::create_dir_all(install.join("releases/stale")).unwrap();
     let updated = run(&launcher, &["update"]);
     assert!(updated.status.success(), "{}", String::from_utf8_lossy(&updated.stderr));
     assert_eq!((text(install.join("current")), text(install.join("previous"))), (next.clone(), version.into()));
