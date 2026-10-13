@@ -5,5 +5,14 @@
   "limits": {
     "claude": 4,
     "codex": 4
-  }
+  },
+  "capacity_hosts": {
+    "macbook-m2.local": {
+      "limits": {
+        "claude": 4,
+        "codex": 0
+      }
+    }
+  },
+  "incident_reports": true
 }
