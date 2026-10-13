@@ -43,6 +43,13 @@ fn real_cli_isolated_state_and_failure() {
             assert_eq!((r["results"][k]["status"].as_str(), r["results"][k]["reason"].as_str()), (Some("unknown"), Some("unsupported-os")), "{k}");
         }
     }
+    // docs/design/enrollment.md: the projection names the catalog of this report and no local path
+    let projection = || Command::new(env!("CARGO_BIN_EXE_serverq")).args(["projection", "--home"]).arg(&home).output().unwrap();
+    let p: Value = serde_json::from_slice(&projection().stdout).unwrap();
+    assert_eq!(p["catalog"], r["catalog"]);
+    assert_eq!(p["rules"].as_object().unwrap().len(), RESULTS.len() + r["manual_rules"].as_array().unwrap().len());
+    assert!(!String::from_utf8_lossy(&projection().stdout).contains(home.to_str().unwrap()));
+    assert_eq!(serde_json::from_slice::<Value>(&projection().stdout).unwrap()["installation"], p["installation"]);
     let missing = check(&home, &["--filesystem", home.join("absent").to_str().unwrap()]);
     assert_eq!(missing.status.code(), Some(2));
     assert_eq!(report(&missing)["results"]["disk-headroom"]["status"], "unknown");

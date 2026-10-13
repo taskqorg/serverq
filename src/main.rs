@@ -12,13 +12,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const RULES: &[u8] = include_bytes!("../rules.json");
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DOCKER: [&str; 3] = ["docker", "--host", "unix:///var/run/docker.sock"];
-const USAGE: &str = "usage: serverq check [--force] [--filesystem PATH] | rules | update | rollback | selftest | service install|run|pause|resume|status|restart|stop|uninstall; every command takes --home PATH";
+const USAGE: &str = "usage: serverq check [--force] [--filesystem PATH] | rules | projection | update | rollback | selftest | service install|run|pause|resume|status|restart|stop|uninstall; every command takes --home PATH";
 const UNIT: &str = "serverq.service";
 const LEGACY_UNITS: [&str; 4] = ["serverq-check.timer", "serverq-update.timer", "serverq-check.service", "serverq-update.service"];
 const LINUX: bool = cfg!(target_os = "linux");
 const UNSUPPORTED: &str = "unsupported-os";
 /// coreq's Windows unit for project `serverq`: `<title>-<project>`.
 const TASK: &str = "ServerQ-serverq";
+/// Fixed `reason` vocabulary of non-`ok` results; the projection exports nothing else (docs/design/enrollment.md).
+const REASONS: [&str; 9] = [UNSUPPORTED, COLLECTION, "capacity-unavailable", "below-minimum", "failed-units", "missing-journal-bounds", "docker-cli-missing", "unsupported-log-driver", "missing-rotation"];
 
 type Obj = Map<String, Value>;
 
@@ -83,6 +85,11 @@ fn run(args: &[String]) -> Result<i32, String> {
         }
         ["rules"] => {
             std::io::stdout().write_all(RULES).map_err(|e| e.to_string())?;
+            Ok(0)
+        }
+        ["projection"] => {
+            let _lock = lock(&t.install)?;
+            println!("{}", pretty(&projection(&t.install)?));
             Ok(0)
         }
         ["update"] => {
@@ -461,7 +468,7 @@ fn audit(home: &Path, filesystem: &str, force: bool) -> Result<Value, String> {
         }
         Err(e) => {
             for k in ["disk-headroom", "inode-headroom"] {
-                results.insert(k.into(), if e == UNSUPPORTED { unsupported() } else { unknown(format!("Filesystem collection failed: {e}")) });
+                results.insert(k.into(), if e == UNSUPPORTED { unsupported() } else { unknown(COLLECTION, format!("Filesystem collection failed: {e}")) });
             }
         }
     }
@@ -474,13 +481,76 @@ fn audit(home: &Path, filesystem: &str, force: bool) -> Result<Value, String> {
     }
     incidents(&mut state, &results, now)?;
     let manual: Vec<&String> = rules.iter().filter(|(_, r)| r["manual"] == true).map(|(k, _)| k).collect();
-    let report = json!({"schema": 1, "at": now, "revision": revision, "filesystem": filesystem, "results": results,
+    let report = json!({"schema": 1, "at": now, "revision": revision, "catalog": sha256(RULES), "filesystem": filesystem, "results": results,
         "incidents": state.get("incidents").cloned().unwrap_or(json!({})), "manual_rules": manual});
     state.insert("revision".into(), revision.into());
     state.insert("last_run".into(), now.into());
     save_json(&home.join("state.json"), &state.into())?;
     save_json(&home.join("report.json"), &report)?;
     Ok(report)
+}
+
+/// The allowlisted view of `report.json` for DashQ (docs/design/enrollment.md): rule IDs, enumerated values,
+/// times and numbers only; detail, paths, unit names and container IDs never leave. It reads, never reruns, a check.
+fn projection(home: &Path) -> Result<Value, String> {
+    let p = home.join("report.json");
+    let report: Value = serde_json::from_slice(&fs::read(&p).map_err(|e| format!("{}: {e}", p.display()))?).map_err(|_| format!("invalid report {}", p.display()))?;
+    if report["schema"] != 1 || !report["results"].is_object() {
+        return Err(format!("invalid report {}; preserve it and investigate", p.display()));
+    }
+    let id = |k: &&String| (1..=64).contains(&k.len()) && k.bytes().all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'-'));
+    let numbers = |v: &Value, fields: &[&str]| -> Obj { fields.iter().filter(|f| v[**f].is_number()).map(|f| (f.to_string(), v[*f].clone())).collect() };
+    let at = &report["at"];
+    let mut rules = Obj::new();
+    for (k, r) in report["results"].as_object().into_iter().flatten().filter(|(k, _)| id(k)) {
+        let mut evidence = numbers(r, &["available", "total"]);
+        for f in ["units", "missing_rotation", "unsupported"] {
+            if let Some(a) = r[f].as_array() {
+                evidence.insert(f.into(), a.len().into());
+            }
+        }
+        let status = r["status"].as_str().filter(|s| ["ok", "warn", "unknown"].contains(s)).unwrap_or("unknown");
+        let observed = if r["checked_at"].is_number() { &r["checked_at"] } else { at };
+        rules.insert(k.clone(), json!({"status": status, "observed_at": observed, "reason": r["reason"].as_str().filter(|s| REASONS.contains(s)), "evidence": evidence}));
+    }
+    for k in report["manual_rules"].as_array().into_iter().flatten().filter_map(Value::as_str).map(String::from).filter(|k| id(&k)) {
+        rules.insert(k, json!({"status": "manual", "observed_at": null, "reason": null, "evidence": {}}));
+    }
+    let mut incidents = Obj::new();
+    for (k, i) in report["incidents"].as_object().into_iter().flatten().filter(|(k, _)| id(k)) {
+        if let Some(state) = i["state"].as_str().filter(|s| ["observed", "verified"].contains(s)) {
+            let mut o = numbers(i, &["first_seen", "last_seen", "occurrences", "verified_at"]);
+            o.insert("state".into(), state.into());
+            incidents.insert(k.clone(), o.into());
+        }
+    }
+    // a report before the `catalog` field has it only when its revision is this binary's
+    let hex = |s: &&str| s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    let catalog = match report["catalog"].as_str().filter(hex) {
+        Some(c) => Some(c.to_string()),
+        None => (report["revision"].as_str() == Some(&sha256(&[RULES, VERSION.as_bytes()].concat()))).then(|| sha256(RULES)),
+    };
+    Ok(json!({"schema": 1, "product": "serverq", "installation": installation(home)?, "version": VERSION,
+        "runtime": format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH), "catalog": catalog,
+        "observed_at": if at.is_number() { at.clone() } else { Value::Null }, "rules": rules, "incidents": incidents}))
+}
+
+/// Random 128-bit hex in `<install>/installation`: survives updates, never derives from the host; a lost file makes a new one.
+fn installation(home: &Path) -> Result<String, String> {
+    use ring::rand::SecureRandom;
+    let p = home.join("installation");
+    match fs::read(&p).map(|b| serde_json::from_slice::<String>(&b)) {
+        Ok(Ok(s)) if s.len() == 32 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) => Ok(s),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let mut b = [0u8; 16];
+            ring::rand::SystemRandom::new().fill(&mut b).map_err(|_| "no system randomness")?;
+            let id: String = b.iter().map(|b| format!("{b:02x}")).collect();
+            save_json(&p, &id.clone().into())?;
+            Ok(id)
+        }
+        Err(e) => Err(format!("{}: {e}", p.display())),
+        Ok(_) => Err(format!("invalid installation id {}; preserve it and investigate", p.display())),
+    }
 }
 
 /// systemd and the system Docker socket exist only on Linux.
@@ -493,17 +563,19 @@ fn linux_probes(state: &mut Obj, results: &mut Obj, now: f64, number: &dyn Fn(&s
             let ttl = number("bounded-journal", "ttl_seconds")?;
             cached(cache, "bounded-journal", &fp, now, ttl, || match command(&["systemd-analyze", "cat-config", "systemd/journald.conf"]) {
                 Ok(text) => journal_policy(&text),
-                Err(e) => unknown(e),
+                Err(e) => unknown(COLLECTION, e),
             })?
         }
-        Err(e) => unknown(format!("Journal config unavailable: {e}")),
+        Err(e) => unknown(COLLECTION, format!("Journal config unavailable: {e}")),
     };
     results.insert("bounded-journal".into(), journal);
     Ok(())
 }
 
-fn unknown(detail: String) -> Value {
-    json!({"status": "unknown", "detail": detail})
+const COLLECTION: &str = "collection-failed";
+
+fn unknown(reason: &str, detail: String) -> Value {
+    json!({"status": "unknown", "detail": detail, "reason": reason})
 }
 
 /// A Linux-only probe on another OS: unknown, never `ok` (serverq.md § 7).
@@ -513,11 +585,14 @@ fn unsupported() -> Value {
 
 fn capacity(total: u64, available: u64, minimum: f64) -> Value {
     if total == 0 {
-        return unknown("Capacity unavailable".into());
+        return unknown("capacity-unavailable", "Capacity unavailable".into());
     }
     let percent = available as f64 * 100.0 / total as f64;
-    json!({"status": if percent < minimum { "warn" } else { "ok" }, "detail": format!("{percent:.1}% available; minimum {minimum}%"),
-        "available": available, "total": total})
+    let mut r = json!({"status": "ok", "detail": format!("{percent:.1}% available; minimum {minimum}%"), "available": available, "total": total});
+    if percent < minimum {
+        (r["status"], r["reason"]) = ("warn".into(), "below-minimum".into());
+    }
+    r
 }
 
 /// Windows has no inodes; its disk probe is a later task (serverq.md § 7).
@@ -584,9 +659,13 @@ fn failed_units(output: Result<String, String>) -> Value {
     match output {
         Ok(text) => {
             let units: Vec<&str> = text.lines().filter_map(|l| l.split_whitespace().next()).collect();
-            json!({"status": if units.is_empty() { "ok" } else { "warn" }, "detail": format!("{} failed system units", units.len()), "units": units})
+            let mut r = json!({"status": "ok", "detail": format!("{} failed system units", units.len()), "units": units});
+            if !units.is_empty() {
+                (r["status"], r["reason"]) = ("warn".into(), "failed-units".into());
+            }
+            r
         }
-        Err(e) => unknown(e),
+        Err(e) => unknown(COLLECTION, e),
     }
 }
 
@@ -610,15 +689,19 @@ fn journal_policy(text: &str) -> Value {
     let missing: Vec<&str> = keys.into_iter().filter(|k| !values.get(*k).and_then(Value::as_str).is_some_and(positive)).collect();
     let detail = if missing.is_empty() { "Persistent and runtime journals have explicit bounds".into() } else { format!("Missing explicit positive journal bounds: {}", missing.join(", ")) };
     let shown: Obj = keys.iter().map(|k| (k.to_string(), values.get(*k).cloned().unwrap_or(Value::Null))).collect();
-    json!({"status": if missing.is_empty() { "ok" } else { "warn" }, "detail": detail, "values": shown})
+    let mut r = json!({"status": "ok", "detail": detail, "values": shown});
+    if !missing.is_empty() {
+        (r["status"], r["reason"]) = ("warn".into(), "missing-journal-bounds".into());
+    }
+    r
 }
 
 /// Every container of the local system daemon, regardless of the caller's Docker context.
 fn docker_logs(cli: bool, socket: bool, run: &mut dyn FnMut(&[&str]) -> Result<String, String>) -> Value {
     match (cli, socket) {
-        (false, true) => unknown("Docker CLI unavailable".into()),
+        (false, true) => unknown("docker-cli-missing", "Docker CLI unavailable".into()),
         (false, false) => json!({"status": "ok", "detail": "System Docker not installed"}),
-        _ => docker_inspect(run).unwrap_or_else(|e| unknown(format!("Docker log collection failed: {e}"))),
+        _ => docker_inspect(run).unwrap_or_else(|e| unknown(COLLECTION, format!("Docker log collection failed: {e}"))),
     }
 }
 
@@ -651,9 +734,13 @@ fn docker_inspect(run: &mut dyn FnMut(&[&str]) -> Result<String, String>) -> Res
             _ => unsupported.push(*id),
         }
     }
-    Ok(json!({"status": if !unsupported.is_empty() { "unknown" } else if !deviations.is_empty() { "warn" } else { "ok" },
-        "detail": format!("{} containers inspected; {} lack explicit positive rotation; {} unsupported log drivers", ids.len(), deviations.len(), unsupported.len()),
-        "missing_rotation": deviations, "unsupported": unsupported}))
+    let (status, reason) = if !unsupported.is_empty() { ("unknown", "unsupported-log-driver") } else if !deviations.is_empty() { ("warn", "missing-rotation") } else { ("ok", "") };
+    let mut r = json!({"status": status, "detail": format!("{} containers inspected; {} lack explicit positive rotation; {} unsupported log drivers", ids.len(), deviations.len(), unsupported.len()),
+        "missing_rotation": deviations, "unsupported": unsupported});
+    if !reason.is_empty() {
+        r["reason"] = reason.into();
+    }
+    Ok(r)
 }
 
 /// `[0-9]+(\.[0-9]+)?([kmg]b?|b)?`, case-insensitive, with a positive number.
@@ -957,6 +1044,52 @@ mod tests {
         assert_eq!(state["incidents"]["disk-headroom"]["first_seen"], 104.0);
         state["incidents"]["disk-headroom"] = json!({"occurrences": 1});
         assert!(incidents(&mut state, &at("warn"), 105.0).is_err(), "corrupt incident is an error");
+    }
+
+    /// A schema-1 report from before `catalog` and `reason`, with private detail in every field DashQ must not see.
+    #[test]
+    fn projection_exports_only_the_allowlist() {
+        let home = scratch("projection");
+        let secret = ["/srv/private", "db.service", &"c".repeat(64), "256M"];
+        let report = json!({"schema": 1, "at": 200.5, "revision": "old", "filesystem": secret[0], "manual_rules": ["service-contract", "../x"],
+            "results": {
+                "disk-headroom": {"status": "warn", "detail": secret[0], "available": 5, "total": 100, "reason": "below-minimum"},
+                "failed-services": {"status": "warn", "detail": "1 failed", "units": [secret[1]]},
+                "bounded-docker-logs": {"status": "unknown", "detail": secret[2], "missing_rotation": [], "unsupported": [secret[2]], "reason": "free text"},
+                "bounded-journal": {"status": "ok", "detail": "x", "values": {"SystemMaxUse": secret[3]}, "cached": true, "checked_at": 150.0},
+                "/etc/passwd": {"status": "ok"}},
+            "incidents": {"disk-headroom": {"first_seen": 1.0, "last_seen": 2.0, "occurrences": 2, "state": "verified", "verified_at": 3.0, "note": secret[0]},
+                "failed-services": {"state": "bogus"}}});
+        fs::write(home.join("report.json"), report.to_string()).unwrap();
+        let p = projection(&home).unwrap();
+        let text = p.to_string();
+        for s in secret.iter().chain(&["../x", "passwd", "free text", "note"]) {
+            assert!(!text.contains(s), "{s} leaked: {text}");
+        }
+        assert_eq!(p["rules"]["disk-headroom"], json!({"status": "warn", "observed_at": 200.5, "reason": "below-minimum", "evidence": {"available": 5, "total": 100}}));
+        assert_eq!(p["rules"]["failed-services"]["evidence"], json!({"units": 1}));
+        assert_eq!((&p["rules"]["bounded-docker-logs"]["status"], &p["rules"]["bounded-docker-logs"]["reason"]), (&json!("unknown"), &Value::Null));
+        assert_eq!(p["rules"]["bounded-journal"]["observed_at"], 150.0, "a cached result keeps its original observation time");
+        assert_eq!(p["rules"]["service-contract"]["status"], "manual");
+        assert_eq!(p["incidents"], json!({"disk-headroom": {"first_seen": 1.0, "last_seen": 2.0, "occurrences": 2, "verified_at": 3.0, "state": "verified"}}));
+        assert_eq!(p["catalog"], Value::Null, "an old report of another revision has no known catalog");
+        let id = p["installation"].as_str().unwrap().to_string();
+        assert_eq!(projection(&home).unwrap()["installation"], id.as_str(), "stable identity");
+        fs::remove_file(home.join("installation")).unwrap();
+        assert_ne!(projection(&home).unwrap()["installation"], id.as_str(), "a lost identity is a new installation");
+        fs::write(home.join("installation"), "host-name").unwrap();
+        assert!(projection(&home).is_err(), "a corrupt identity is kept, never replaced");
+    }
+
+    #[test]
+    fn every_non_ok_result_has_a_known_reason() {
+        let ids = ["a".repeat(64)];
+        for r in [capacity(100, 5, 10.0), capacity(0, 0, 10.0), failed_units(Ok("a.service x\n".into())), failed_units(Err("e".into())), journal_policy(""), unsupported(),
+            docker_logs(false, true, &mut |_| unreachable!()), docker(vec![Ok(&ids[0]), Ok(r#"{"Type": "fluentd", "Config": {}}"#)], &mut vec![]),
+            docker(vec![Ok(&ids[0]), Ok(r#"{"Type": "local", "Config": {}}"#)], &mut vec![])] {
+            assert!(REASONS.contains(&r["reason"].as_str().unwrap()), "{r}");
+        }
+        assert!(capacity(100, 50, 10.0).get("reason").is_none());
     }
 
     #[cfg(windows)]
