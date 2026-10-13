@@ -1,0 +1,101 @@
+# serverq contract
+
+serverq checks a Linux server against the agreed server-care rules and reports deviations to agents and monitors. This file is the whole contract of **v1**, the Rust binary built on [coreq](https://github.com/taskqorg/coreq). It follows the [specq release contract](https://github.com/taskqorg/specq/blob/main/engineering/release-contract.md); coreq.md holds the shared update, launcher, service and `status.json` detail. The Python `serverq.py` (0.2.x) stays the shipped version until the cutover in § 6. A change that alters a decision edits this file first, in the same deliverable as the code. No history here; at most 200 lines.
+
+## 1. Principles
+
+- **Read-only.** serverq writes only its own install folder. It never changes server settings, deletes operator data, resets failures, restarts other services, runs AI or applies recommendations. Remediation is a separate, explicitly authorized action by an agent or operator.
+- **One catalog.** `rules.json` at the repository root is the only recommendation catalog. The binary embeds its exact bytes at build time; no other file, doc or agent copies its thresholds.
+- **Unknown is never healthy.** A collection error, an unsupported OS, corrupt state or a stale value reads `unknown` with a reason, never `ok`, zero or success.
+- **Dynamic checks every time.** Capacity and service checks run on every pass. Only configuration checks are cached (§ 3).
+- **Manual rules stay manual.** A rule with `manual: true` is listed, never claimed as automatically verified. Exit 0 never certifies manual rules.
+
+## 2. Commands
+
+| Command | Effect | Exit |
+|---|---|---|
+| `serverq check [--force] [--filesystem PATH]` | One audit (§ 3); prints the report JSON and writes `report.json` | 0 all automated checks `ok`; 1 completed with a `warn`; 2 any `unknown`, collection or state failure |
+| `serverq rules` | Prints the embedded `rules.json` bytes unchanged | 0 |
+| `serverq update` | coreq update (§ 4) | coreq |
+| `serverq rollback` | coreq rollback: `previous` into `current`, then `service pause` (§ 4) | coreq |
+| `serverq selftest` | coreq harness: unit checks plus one `check` in a temporary install | 0 or 1 pass; 2 fails |
+| `serverq service install\|run\|pause\|resume\|status\|restart\|stop\|uninstall\|list` | coreq service (§ 5) | coreq |
+
+- `--home PATH` (every command) replaces the install folder; tests and isolated runs use it.
+- Exit codes and the report schema are the Python ones; a monitor reading either keeps working.
+- `--version` and `--unpin` are dropped with the pin (§ 4). `--lock-fd` and `--in-transaction` are dropped with the journal.
+- Errors go to stderr as `serverq <command> failed; no healthy result claimed: <reason>`, exit 2.
+
+## 3. Check and report
+
+Checks, in the order of `rules.json`:
+
+| Rule | Probe | Cached |
+|---|---|---|
+| `disk-headroom` | free bytes of `--filesystem` (default `/`) against `minimum_percent` | no |
+| `inode-headroom` | available inodes against `minimum_percent` | no |
+| `failed-services` | `systemctl --failed --no-legend --plain --no-pager` (system units only) | no |
+| `bounded-docker-logs` | every container of the local system daemon `unix:///var/run/docker.sock`, stopped ones included; remote contexts ignored | no |
+| `bounded-journal` | `systemd-analyze cat-config systemd/journald.conf`: positive `SystemMaxUse`, `SystemKeepFree`, `RuntimeMaxUse` | yes, `ttl_seconds` |
+
+- Docker: `json-file`/`local` need positive `max-size` and `max-file`; `journald` and `none` pass; other drivers are `unknown`; a socket without the CLI is `unknown`; no daemon is `ok`. Rootless daemons stay a manual inventory item.
+- Commands run without a shell, with a 15 s timeout; a nonzero exit or timeout is `unknown` for that rule.
+- Cache: key, fingerprint of the probed config files, time. A hit needs the same fingerprint and an age in `[0, ttl)`. An `unknown` result is never cached. `--force`, or a `revision` different from the stored one, clears the cache. `revision` = sha256 of the embedded `rules.json` bytes plus the binary version.
+- Incidents per rule: a `warn` opens or continues `{first_seen, last_seen, occurrences, state: observed}`; a later `ok` sets `state: verified, verified_at`. They survive restarts.
+- `report.json` schema 1, unchanged: `schema`, `at` (Unix seconds), `revision`, `filesystem`, `results` (`status` `ok|warn|unknown`, `detail`, probe fields, `cached`, `checked_at` for cached rules), `incidents`, `manual_rules`.
+- `state.json` schema 1, unchanged: `schema`, `cache`, `incidents`, `revision`, `last_run`. Another schema or unreadable JSON is an error: the file is kept for investigation, never reset.
+- Files are written atomically (temp file, fsync, rename, directory fsync), mode 0600, in a 0700 folder. An exclusive lock `<install>/lock` serializes `check` runs; a busy lock is exit 2, never a skipped audit reported as healthy.
+
+## 4. Release, update, rollback
+
+coreq owns all of it; serverq passes tool name `serverq`, install folder and release repository `taskqorg/serverq` as parameters.
+
+- Release: CI on a `v*` tag builds `serverq-<ver>-linux-<arch>` for `x86_64` and `aarch64`, `SHA256SUMS` and `latest.json`. Each artifact passes `selftest` before publishing. One static binary: hosts need no Python, git or toolchain.
+- Install folder `~/.local/share/serverq` (`<install>`): immutable `releases/<ver>/`, `current`, `previous`, the launcher `<install>/serverq`, coreq's `status.json`, plus serverq's `report.json`, `state.json`, `lock`.
+- Update: coreq steps (read `latest.json`, download into `releases/<ver>.tmp/`, verify sha256, `selftest`, swap `current`). Old releases follow coreq retention.
+- Rollback: the launcher restores `previous` after repeated failed starts. A manual `rollback` restores `previous` and pauses updates so the next pass does not reinstall the rolled-back version; `service resume` returns to normal updates.
+- Compatibility N/N-1: a release changes `report.json` and `state.json` only additively; a new schema number needs a cutover task.
+
+Dropped from the Python version, because coreq covers them:
+
+| Python behavior | Why dropped |
+|---|---|
+| Own updater (GitHub Releases API, ZIP plus manifest, bounded downloads, unpack checks, packaged tests on update, `tools/package_release.py`, three `versions/`) | coreq downloads one binary checked against `SHA256SUMS` and smoke-tests it with `selftest` before the swap; CI builds the release |
+| Pin (`pin.json`, `--unpin`) | Rollback pauses updates in coreq's service state; resume is the explicit unpin. A bad release is fixed forward by a newer one |
+| Transaction journal (`transaction.json`, bootstrap dispatcher, `app` pointer recovery) | Switching versions is one atomic rename of `current`; releases are immutable and data lives outside them, so there is nothing to restore |
+| `update.json` | The update outcome goes to coreq's `status.json` |
+
+## 5. Service
+
+One OS unit replaces `serverq-check.service`, `serverq-check.timer`, `serverq-update.service` and `serverq-update.timer`.
+
+- `serverq service install` writes the coreq unit `~/.config/systemd/user/serverq.service` running `<install>/serverq service run`, restarting on failure. A host that must check without a login session needs `loginctl enable-linger <user>` (an operator step; serverq does not run it).
+- The unit keeps the Python resource caps and sandbox: `UMask=0077`, `NoNewPrivileges=yes`, `PrivateTmp=yes`, `ProtectSystem=strict`, `ReadWritePaths=<install>`, `MemoryMax=128M`, `TasksMax=32`.
+- `service run` loop: a check 5 min after start, then every `check_every` (3600 s); the coreq update check 15 min after start, then every `update_every` (86400 s). One loop: a check and an update never overlap. A check result 1 is a normal pass, not a service failure.
+- `pause` stops updates only; checks continue, since stopping them would hide deviations. `resume` restarts updates.
+- `status.json` (coreq keys) adds `check`: `at`, `exit`, counts per status, `report` path. Missing, or older than 2 × `check_every`, reads unknown with a reason. `service status` prints `Check: ok|warn|unknown <age>` and `Update: <version|up to date|paused|unknown>`.
+- Monitors read `report.json` or `status.json`; serverq adds no second scheduler, cleaner or notifier.
+
+## 6. Migration of the legacy layout
+
+Once per host, by `serverq service install` from the downloaded binary. The legacy layout is a real `~/.serverq` folder with `bootstrap/` or `app`.
+
+1. Take the legacy `~/.serverq/lock`. A `transaction.json` present: refuse; the operator first runs the legacy `check`, which recovers it.
+2. Validate legacy `state.json` and `report.json` (schema 1). Corrupt: refuse, change nothing.
+3. Disable and stop the four legacy units with `systemctl --user disable --now`. Their files stay.
+4. Copy `state.json` and `report.json` into `<install>`; the new `revision` clears the cache, incidents carry over.
+5. Rename `~/.serverq` to `<install>/legacy/` (never deleted), then link `~/.serverq` to `<install>`, so `~/.serverq/report.json` keeps working for existing monitors.
+6. Install and start `serverq.service`, run one check, print every step done.
+
+- A failure before step 5 re-enables the legacy timers and leaves `~/.serverq` unchanged. A failure after it prints the exact rollback.
+- Rollback: `service uninstall`, remove the `~/.serverq` link, rename `<install>/legacy` back to `~/.serverq`, `systemctl --user enable --now serverq-check.timer serverq-update.timer`.
+- A second install finds the link and does not migrate. `pin.json`, `update.json` and `versions/` stay in `legacy/` unread.
+- The cutover deletes `serverq.py`, `tools/`, `systemd/`, `release.json` and the Python tests in the same deliverable that ships v1.0.0; the last Python release stays downloadable.
+
+## 7. Windows, later
+
+Not built in v1. A later task adds `serverq-<ver>-windows-<arch>`, the coreq Scheduled Task unit and Windows probes, and amends § 3 per rule. Until then a Linux-only probe on another OS is `unknown`, never `ok`.
+
+## 8. Checks
+
+`cargo test --locked`, then `serverq selftest`, then `serverq check --home <temp>` on the authorized host. Tests cover each rule's `ok`/`warn`/`unknown`, cache hit, TTL and revision invalidation, corrupt state, exit codes, and the migration steps against a fake legacy folder.

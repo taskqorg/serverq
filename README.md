@@ -4,6 +4,8 @@ Minimal server-care recommendations, a stateful read-only Linux checker, and a c
 
 Author: Tight <tight@kirs.online>.
 
+Every decision, including the planned Rust binary on coreq that replaces this Python version, lives in [serverq.md](serverq.md).
+
 ## Agent-led remediation
 
 Give an authorized agent this instruction:

@@ -2,6 +2,7 @@
 
 Author: Tight <tight@kirs.online>
 
+- Read [serverq.md](serverq.md) first: it holds every decision, including the Rust rewrite on coreq. Spec first: a change that alters a decision edits serverq.md first.
 - ServerQ is the canonical home for agreed reusable server-care principles. When a server maintenance task establishes a new principle, add or refine it here with evidence, a verification method and appropriate tests. Keep machine-specific inventory private, not in this repository.
 - `rules.json` is the only canonical recommendation catalog. Do not copy its thresholds into documentation or other agents. Human/manual recommendations must not be claimed as automatically verified.
 - Read README.md before changes. Use Python standard library only unless a demonstrated requirement justifies a dependency.
