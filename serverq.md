@@ -55,7 +55,7 @@ coreq owns all of it; serverq passes tool name `serverq`, install folder and rel
 
 - Release: CI on a `v*` tag builds `serverq-<ver>-linux-<arch>` for `x86_64` and `aarch64` and `serverq-<ver>-windows-x86_64.exe` (§ 7), `SHA256SUMS` and `latest.json`. Each artifact passes `selftest` before publishing. One static binary: hosts need no Python, git or toolchain.
 - Install folder `~/.local/share/serverq` (`<install>`): immutable `releases/<ver>/`, `current`, `previous`, the launcher `<install>/serverq`, `status.json`, `paused`, plus serverq's `report.json`, `state.json`, `lock`. The repository keeps version `1.0.0-dev`; the tag sets the release version, so a build from a branch is older than any release.
-- Update: coreq steps (read `latest.json`, download into `releases/<ver>.tmp/`, verify sha256, `selftest`, swap `current`). Old release folders stay.
+- Update: coreq steps (read `latest.json`, download into `releases/<ver>.tmp/`, verify sha256, `selftest`, swap `current`). Each update prunes `releases/` to `current` and `previous`; a folder in use stays until the next update.
 - Rollback: the launcher restores `previous` after three `service run` starts of a version that never wrote `releases/<ver>/healthy`; `service run` writes it after its first completed check. A manual `rollback` writes `previous` into `current`, swaps them, pauses updates and restarts an installed service; `service resume` returns to normal updates. coreq never reinstalls a version whose folder exists, so a rolled-back release returns only with a newer one.
 - Compatibility N/N-1: a release changes `report.json` and `state.json` only additively; a new schema number needs a cutover task.
 
