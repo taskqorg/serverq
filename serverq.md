@@ -87,11 +87,11 @@ Once per host, by `serverq service install` from the downloaded binary. The lega
 2. Validate legacy `state.json` and `report.json` (schema 1). Corrupt: refuse, change nothing.
 3. Stop the four legacy units: `systemctl --user disable --now` the two timers, `systemctl --user stop` the two oneshot services, which have no install section. Their files stay.
 4. Copy `state.json` and `report.json` into `<install>`; the new `revision` clears the cache, incidents carry over.
-5. Rename `~/.serverq` to `<install>/legacy/` (never deleted), then link `~/.serverq` to `<install>`, so `~/.serverq/report.json` keeps working for existing monitors.
+5. Rename `~/.serverq` to `<install>/legacy/`, then link `~/.serverq` to `<install>`, so `~/.serverq/report.json` keeps working for existing monitors. `legacy/` exists for the rollback only; once the new install is verified the operator deletes it by hand, and serverq never touches it again.
 6. Install and start `serverq.service`, run one check, print every step done.
 
 - A failure before step 5 re-enables the legacy timers and leaves `~/.serverq` unchanged. A failure after it prints the exact rollback.
-- Rollback: `service uninstall`, remove the `~/.serverq` link, rename `<install>/legacy` back to `~/.serverq`, `systemctl --user enable --now serverq-check.timer serverq-update.timer`.
+- Rollback (while `<install>/legacy` exists): `service uninstall`, remove the `~/.serverq` link, rename `<install>/legacy` back to `~/.serverq`, `systemctl --user enable --now serverq-check.timer serverq-update.timer`.
 - A second install finds the link and does not migrate. `pin.json`, `update.json` and `versions/` stay in `legacy/` unread.
 - The last Python release, v0.2.1, stays downloadable.
 
