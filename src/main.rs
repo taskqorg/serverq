@@ -11,7 +11,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const RULES: &[u8] = include_bytes!("../rules.json");
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DOCKER: [&str; 3] = ["docker", "--host", "unix:///var/run/docker.sock"];
-const USAGE: &str = "usage: serverq check [--force] [--filesystem PATH] [--home PATH]";
+const USAGE: &str = "usage: serverq check [--force] [--filesystem PATH] | rules | update | rollback | selftest | service install|run|pause|resume|status|restart|stop|uninstall; every command takes --home PATH";
+const UNIT: &str = "serverq.service";
+const LEGACY_UNITS: [&str; 4] = ["serverq-check.timer", "serverq-update.timer", "serverq-check.service", "serverq-update.service"];
 
 type Obj = Map<String, Value>;
 
@@ -25,25 +27,308 @@ fn main() {
 }
 
 fn run(args: &[String]) -> Result<i32, String> {
-    if args.first().map(String::as_str) != Some("check") {
-        return Err(USAGE.into());
+    let mut t = coreq::Tool::new("serverq", "ServerQ", "taskqorg/serverq", VERSION);
+    if let Some(i) = args.iter().position(|a| a == "--home") {
+        let h = args.get(i + 1).ok_or(USAGE)?;
+        t.install = std::path::absolute(h).map_err(|e| format!("{h}: {e}"))?;
     }
-    let (mut home, mut filesystem, mut force) = (None, "/".to_string(), false);
-    let mut it = args[1..].iter();
+    // the launcher copy only picks the release to run, before parsing: a newer release may take new arguments (coreq.md § Launcher)
+    let me = std::env::current_exe().and_then(fs::canonicalize).ok();
+    if me.is_some() && me == fs::canonicalize(t.install.join("serverq")).ok() {
+        coreq::launcher::launch(&t, args);
+    }
+    let (mut words, mut filesystem, mut force) = (vec![], "/".to_string(), false);
+    let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
-            "--home" => home = Some(PathBuf::from(it.next().ok_or(USAGE)?)),
+            "--home" => _ = it.next(),
             "--filesystem" => filesystem = it.next().ok_or(USAGE)?.clone(),
             "--force" => force = true,
-            _ => return Err(format!("unknown argument {a}; {USAGE}")),
+            _ if a.starts_with("--") => return Err(format!("unknown argument {a}; {USAGE}")),
+            _ => words.push(a.as_str()),
         }
     }
-    let home = home.unwrap_or_else(|| coreq::Tool::new("serverq", "ServerQ", "taskqorg/serverq", VERSION).install);
-    let _lock = lock(&home)?;
-    let report = audit(&home, &filesystem, force)?;
-    println!("{}", pretty(&report));
+    match words[..] {
+        ["check"] => {
+            let (code, report) = check(&t.install, &filesystem, force)?;
+            println!("{}", pretty(&report));
+            Ok(code)
+        }
+        ["rules"] => {
+            std::io::stdout().write_all(RULES).map_err(|e| e.to_string())?;
+            Ok(0)
+        }
+        ["update"] => {
+            match coreq::update::update(&t, false)? {
+                Some(v) => println!("serverq: updated to {v}"),
+                None => println!("serverq: up to date"),
+            }
+            Ok(0)
+        }
+        ["rollback"] => rollback(&t),
+        ["selftest"] => selftest(),
+        ["service", cmd] => service(&t, cmd),
+        _ => Err(USAGE.into()),
+    }
+}
+
+/// One locked audit; exit 0 all `ok`, 1 a `warn`, 2 any `unknown`.
+fn check(home: &Path, filesystem: &str, force: bool) -> Result<(i32, Value), String> {
+    let _lock = lock(home)?;
+    let report = audit(home, filesystem, force)?;
     let statuses: Vec<&str> = report["results"].as_object().into_iter().flatten().map(|(_, r)| r["status"].as_str().unwrap_or("unknown")).collect();
-    Ok(if statuses.contains(&"unknown") { 2 } else if statuses.contains(&"warn") { 1 } else { 0 })
+    Ok((if statuses.contains(&"unknown") { 2 } else if statuses.contains(&"warn") { 1 } else { 0 }, report))
+}
+
+/// A check in a temporary install that names every automated rule; host health does not decide the outcome.
+fn selftest() -> Result<i32, String> {
+    let rules: Obj = serde_json::from_slice(RULES).map_err(|e| format!("rules.json: {e}"))?;
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.subsec_nanos());
+    let dir = std::env::temp_dir().join(format!("serverq-selftest-{}-{nanos}", std::process::id()));
+    // a fresh 0700 folder: an existing path or a planted link fails instead of being written through
+    fs::DirBuilder::new().mode(0o700).create(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let result = check(&dir, "/", true);
+    let _ = fs::remove_dir_all(&dir);
+    let (code, report) = result?;
+    let missing: Vec<&String> = rules.iter().filter(|(k, r)| r["manual"] != true && report["results"].get(k.as_str()).is_none()).map(|(k, _)| k).collect();
+    if !missing.is_empty() {
+        return Err(format!("selftest: no result for {missing:?}"));
+    }
+    println!("serverq {VERSION} selftest passed; check exit {code}");
+    Ok(0)
+}
+
+/// `previous` becomes `current`, updates pause and an installed service restarts on the restored release.
+fn rollback(t: &coreq::Tool) -> Result<i32, String> {
+    let read = |n: &str| fs::read_to_string(t.install.join(n)).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let (Some(prev), Some(cur)) = (read("previous"), read("current")) else { return Err("no previous release to roll back to".into()) };
+    if !t.release_exe(&prev).exists() {
+        return Err(format!("previous release {prev} is missing"));
+    }
+    coreq::write_atomic(&t.install.join("previous"), &cur)?;
+    coreq::write_atomic(&t.install.join("current"), &prev)?;
+    fs::write(t.install.join("paused"), "").map_err(|e| e.to_string())?;
+    println!("serverq: rolled back from {cur} to {prev}; updates paused until `serverq service resume`");
+    if unit(t).path.exists() {
+        systemctl(&["restart", UNIT])?;
+    }
+    Ok(0)
+}
+
+fn service(t: &coreq::Tool, cmd: &str) -> Result<i32, String> {
+    let paused = t.install.join("paused");
+    match cmd {
+        "pause" => fs::write(&paused, "").map_err(|e| e.to_string())?,
+        "resume" => match fs::remove_file(&paused) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.to_string()),
+            _ => {}
+        },
+        "status" => return service_status(t),
+        "run" => return serve(t),
+        _ if !cfg!(target_os = "linux") => return Err("the service is Linux only (serverq.md § 7)".into()),
+        "install" => return install(t),
+        "restart" | "stop" => systemctl(&[cmd, UNIT])?,
+        "uninstall" => {
+            let u = unit(t);
+            coreq::service::run_all(&u.unload, true)?;
+            if let Err(e) = fs::remove_file(&u.path)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                return Err(format!("{}: {e}", u.path.display()));
+            }
+            systemctl(&["daemon-reload"])?;
+        }
+        _ => return Err(USAGE.into()),
+    }
+    println!("serverq: service {cmd} done");
+    Ok(0)
+}
+
+fn systemctl(args: &[&str]) -> Result<(), String> {
+    coreq::service::run_all(&[[&["systemctl", "--user"][..], args].concat().iter().map(|s| s.to_string()).collect()], false)
+}
+
+/// The one user unit; it keeps the Python units' resource caps and sandbox.
+fn unit(t: &coreq::Tool) -> coreq::service::Unit {
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+    let i = t.install.display();
+    let path_env = std::env::var("PATH").unwrap_or_default();
+    let text = format!(
+        "[Unit]\nDescription=ServerQ read-only server audit and updates\n\n[Service]\nExecStart=\"{i}/serverq\" service run --home \"{i}\"\nRestart=always\nRestartSec=10\nUMask=0077\nNoNewPrivileges=yes\nPrivateTmp=yes\nProtectSystem=strict\nReadWritePaths={i}\nMemoryMax=128M\nTasksMax=32\nEnvironment=PATH={path_env}\n\n[Install]\nWantedBy=default.target\n"
+    );
+    let sv = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    coreq::service::Unit {
+        path: home.join(".config/systemd/user").join(UNIT),
+        text,
+        load: vec![sv(&["systemctl", "--user", "daemon-reload"]), sv(&["systemctl", "--user", "enable", "--now", UNIT])],
+        unload: vec![sv(&["systemctl", "--user", "disable", "--now", UNIT])],
+        stop: vec![sv(&["systemctl", "--user", "stop", UNIT])],
+    }
+}
+
+/// serverq.md § 5 and § 6: migrate a legacy `~/.serverq` once, install this binary, start the unit, run one check.
+fn install(t: &coreq::Tool) -> Result<i32, String> {
+    let legacy = PathBuf::from(std::env::var_os("HOME").ok_or("HOME is not set")?).join(".serverq");
+    let real = fs::symlink_metadata(&legacy).is_ok_and(|m| m.is_dir());
+    let (held, migrated) = if real && (legacy.join("bootstrap").exists() || legacy.join("app").exists()) { (Some(migrate(t, &legacy)?), true) } else { (None, false) };
+    let rollback = format!(
+        "rollback: serverq service uninstall; rm {l}; mv {i}/legacy {l}; systemctl --user enable --now serverq-check.timer serverq-update.timer",
+        l = legacy.display(),
+        i = t.install.display()
+    );
+    let after = |e: String| if migrated { format!("{e}; {rollback}") } else { e };
+    coreq::update::install_self(t).map_err(after)?;
+    println!("6. installed serverq {VERSION} as {}", t.install.join("serverq").display());
+    let u = unit(t);
+    coreq::service::write_unit(&u).and_then(|_| coreq::service::run_all(&u.load, false)).map_err(after)?;
+    println!("6. started {}", u.path.display());
+    drop(held);
+    let (code, _) = check(&t.install, "/", false).map_err(after)?;
+    println!("6. check exit {code}, report {}", t.install.join("report.json").display());
+    if migrated {
+        println!("{rollback}");
+    }
+    Ok(0)
+}
+
+/// Steps 1-5 of serverq.md § 6; returns the held legacy lock. A failure before step 5 restores the legacy timers.
+fn migrate(t: &coreq::Tool, legacy: &Path) -> Result<File, String> {
+    let held = OpenOptions::new().append(true).create(true).mode(0o600).open(legacy.join("lock")).map_err(|e| format!("legacy lock: {e}"))?;
+    held.try_lock().map_err(|_| "the legacy serverq is running; retry after it ends")?;
+    if legacy.join("transaction.json").exists() {
+        return Err("legacy transaction.json present: run the legacy check first, which recovers it".into());
+    }
+    let state = legacy.join("state.json");
+    if state.exists() {
+        load_state(&state)?;
+    }
+    let report = legacy.join("report.json");
+    if report.exists() {
+        let r: Value = fs::read(&report).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        if r["schema"] != 1 || !r["results"].is_object() {
+            return Err(format!("invalid legacy report {}; preserve it and investigate", report.display()));
+        }
+    }
+    println!("1-2. legacy lock taken; state.json and report.json valid");
+    let restore = |e: String| {
+        let back = systemctl(&["enable", "--now", LEGACY_UNITS[0], LEGACY_UNITS[1]]);
+        format!("{e}; legacy timers re-enabled: {}", back.map_or_else(|b| b, |_| "yes".into()))
+    };
+    systemctl(&[&["disable", "--now"][..], &LEGACY_UNITS[..2]].concat())
+        .and_then(|_| systemctl(&[&["stop"][..], &LEGACY_UNITS[2..]].concat()))
+        .map_err(restore)?;
+    println!("3. legacy units stopped; their files stay");
+    let copy = || -> Result<(), String> {
+        let _install = lock(&t.install)?;
+        for f in [&state, &report].into_iter().filter(|f| f.exists()) {
+            let v: Value = serde_json::from_slice(&fs::read(f).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+            save_json(&t.install.join(f.file_name().unwrap_or_default()), &v)?;
+        }
+        Ok(())
+    };
+    copy().map_err(restore)?;
+    println!("4. state.json and report.json copied into {}", t.install.display());
+    let moved = t.install.join("legacy");
+    fs::rename(legacy, &moved).map_err(|e| restore(format!("move {}: {e}", legacy.display())))?;
+    if let Err(e) = std::os::unix::fs::symlink(&t.install, legacy) {
+        let _ = fs::rename(&moved, legacy);
+        return Err(restore(format!("link {}: {e}", legacy.display())));
+    }
+    println!("5. {} moved to {}; {} links to the install folder", legacy.display(), moved.display(), legacy.display());
+    Ok(held)
+}
+
+fn every(var: &str, default: u64) -> Duration {
+    Duration::from_secs(std::env::var(var).ok().and_then(|v| v.parse().ok()).filter(|n| *n > 0).unwrap_or(default))
+}
+
+/// One loop: check 5 min after start then hourly, update 15 min after start then daily; never both at once.
+fn serve(t: &coreq::Tool) -> Result<i32, String> {
+    let (check_every, update_every) = (every("SERVERQ_CHECK_EVERY", 3600), every("SERVERQ_UPDATE_EVERY", 86400));
+    let start = Instant::now();
+    let (mut next_check, mut next_update) = (start + check_every.min(Duration::from_secs(300)), start + update_every.min(Duration::from_secs(900)));
+    let host = fs::read_to_string("/proc/sys/kernel/hostname").or_else(|_| fs::read_to_string("/etc/hostname")).map(|h| h.trim().to_string()).unwrap_or_default();
+    let (mut check_status, mut update_at, mut check_error, mut update_error): (Value, Value, Option<String>, Option<String>) = (Value::Null, Value::Null, None, None);
+    // the launcher runs `releases/<ver>/serverq`; a first completed check marks that release healthy
+    let healthy = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("healthy"))).filter(|h| h.parent().and_then(Path::parent) == Some(&t.install.join("releases")));
+    println!("serverq {VERSION}: service started");
+    loop {
+        std::thread::sleep(next_check.min(next_update).saturating_duration_since(Instant::now()));
+        let paused = t.install.join("paused").exists();
+        if Instant::now() >= next_check {
+            next_check += check_every;
+            match check(&t.install, "/", false) {
+                Ok((code, report)) => {
+                    let mut counts = Obj::new();
+                    for (_, r) in report["results"].as_object().into_iter().flatten() {
+                        let k = r["status"].as_str().unwrap_or("unknown");
+                        let n = counts.get(k).and_then(Value::as_u64).unwrap_or(0) + 1;
+                        counts.insert(k.into(), n.into());
+                    }
+                    check_status = json!({"at": now() as u64, "exit": code, "counts": counts, "report": t.install.join("report.json")});
+                    println!("serverq: check exit {code} {}", check_status["counts"]);
+                    if let Some(h) = &healthy {
+                        let _ = fs::write(h, "");
+                    }
+                    check_error = None;
+                }
+                Err(e) => {
+                    check_status = json!({"at": now() as u64, "exit": 2, "counts": {}, "report": Value::Null});
+                    println!("serverq: check failed: {e}");
+                    check_error = Some(format!("check: {e}"));
+                }
+            }
+        } else {
+            next_update += update_every;
+            update_at = (now() as u64).into();
+            if paused {
+                println!("serverq: update paused");
+            } else {
+                match coreq::update::update(t, false) {
+                    Ok(Some(v)) => {
+                        println!("serverq: updated to {v}; restarting");
+                        return Ok(75);
+                    }
+                    Ok(None) => {
+                        println!("serverq: up to date");
+                        update_error = None;
+                    }
+                    Err(e) => {
+                        println!("serverq: update failed: {e}");
+                        update_error = Some(format!("update: {e}"));
+                    }
+                }
+            }
+        }
+        let error = [&check_error, &update_error].into_iter().flatten().cloned().collect::<Vec<_>>();
+        let mut s = coreq::status::common(t, &host, "serverq", now() as u64, (!error.is_empty()).then(|| error.join("; ")), None);
+        s["check"] = check_status.clone();
+        s["update_at"] = update_at.clone();
+        s["paused"] = t.install.join("paused").exists().into();
+        coreq::write_atomic(&t.install.join("status.json"), &pretty(&s))?;
+    }
+}
+
+/// `Check: ok|warn|unknown <age>` and `Update: <version|up to date|paused|unknown>`; unknown exits 2.
+fn service_status(t: &coreq::Tool) -> Result<i32, String> {
+    let max = 2 * every("SERVERQ_CHECK_EVERY", 3600).as_secs();
+    let p = t.install.join("status.json");
+    let s: Option<Value> = fs::read(&p).ok().and_then(|b| serde_json::from_slice(&b).ok());
+    let age = s.as_ref().and_then(|s| s["check"]["at"].as_u64()).map(|at| (now() as u64).saturating_sub(at));
+    let check = match (&s, age) {
+        (None, _) => format!("unknown ({} missing or unreadable)", p.display()),
+        (_, None) => "unknown (no check yet)".into(),
+        (_, Some(a)) if a > max => format!("unknown (last check {a}s ago, over {max}s)"),
+        (Some(s), Some(a)) => format!("{} {a}s ago", ["ok", "warn"].get(s["check"]["exit"].as_u64().unwrap_or(2) as usize).unwrap_or(&"unknown")),
+    };
+    let update = match &s {
+        _ if t.install.join("paused").exists() => "paused".to_string(),
+        Some(s) if s["error"].as_str().is_some_and(|e| e.contains("update: ")) => format!("unknown ({})", s["error"].as_str().unwrap_or_default()),
+        Some(s) if s["update_at"].is_u64() => format!("up to date ({})", t.current().unwrap_or(VERSION.into())),
+        _ => "unknown (no update pass yet)".into(),
+    };
+    println!("Check: {check}\nUpdate: {update}");
+    Ok(if check.starts_with("unknown") { 2 } else { 0 })
 }
 
 /// Exclusive `<home>/lock`; a busy lock is an error, never a skipped audit.

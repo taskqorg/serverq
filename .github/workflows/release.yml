@@ -1,0 +1,69 @@
+# serverq.md § 4 Release: one static Linux binary per arch, SHA256SUMS, latest.json. A failing selftest publishes nothing.
+name: release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            arch: x86_64
+          - os: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.os }}
+    env:
+      SERVERQ_SELFTEST_OFFLINE: '1'
+      TARGET: ${{ matrix.arch }}-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: rustup update stable --no-self-update && rustup default stable && rustup target add "$TARGET"
+      - name: Version from tag
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          perl -pi -e 'if (!$d && s/^version = ".*"/version = "'"$ver"'"/) { $d = 1 }' Cargo.toml
+          grep -q "^version = \"$ver\"" Cargo.toml
+          echo "VER=$ver" >> "$GITHUB_ENV"
+      - run: cargo test
+      - run: cargo build --release --target "$TARGET"
+      - name: Selftest and stage
+        run: |
+          bin="target/$TARGET/release/serverq"
+          file "$bin" | grep -Eq 'static(ally|-pie) linked'
+          "$bin" selftest
+          mkdir dist
+          cp "$bin" "dist/serverq-$VER-linux-${{ matrix.arch }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}
+          path: dist/*
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Describe
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          cd dist
+          sha256sum serverq-* > SHA256SUMS
+          python3 - "$ver" <<'PY'
+          import json, os, sys
+          ver = sys.argv[1]
+          files = {n[len(f'serverq-{ver}-'):]: n for n in sorted(os.listdir('.')) if n.startswith(f'serverq-{ver}-')}
+          assert set(files) == {'linux-x86_64', 'linux-aarch64'}, files
+          json.dump({'version': ver, 'files': files}, open('latest.json', 'w'), indent=1)
+          PY
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --title "ServerQ $GITHUB_REF_NAME" --notes "serverq $GITHUB_REF_NAME"
