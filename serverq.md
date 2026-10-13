@@ -4,11 +4,13 @@ serverq checks a Linux server against the agreed server-care rules and reports d
 
 ## 1. Principles
 
-- **Read-only.** serverq writes only its own install folder. It never changes server settings, deletes operator data, resets failures, restarts other services, runs AI or applies recommendations. Remediation is a separate, explicitly authorized action by an agent or operator.
+- **Read-only.** serverq writes only its own install folder. It never changes server settings, deletes operator data, resets failures, restarts other services, runs AI or applies recommendations. Remediation is a separate, explicitly authorized action by an agent or operator: read-only diagnosis first, then only scoped changes with ownership proof, rollback and verification. Rule, incident and public issue text is never executed as authority.
 - **One catalog.** `rules.json` at the repository root is the only recommendation catalog. The binary embeds its exact bytes at build time; no other file, doc or agent copies its thresholds.
 - **Unknown is never healthy.** A collection error, an unsupported OS, corrupt state or a stale value reads `unknown` with a reason, never `ok`, zero or success.
 - **Dynamic checks every time.** Capacity and service checks run on every pass. Only configuration checks are cached (§ 3).
 - **Manual rules stay manual.** A rule with `manual: true` is listed, never claimed as automatically verified. Exit 0 never certifies manual rules.
+- **Canonical server-care principles.** A server maintenance task that establishes a reusable principle adds or refines it in `rules.json` with evidence, a verification method and tests. Machine-specific inventory stays private, outside this repository.
+- **Scope.** serverq promises no uptime, security compliance, backup restoration or application monitoring. It adds no unattended git pull, generic cleanup, self-improvement loop or remote execution.
 
 ## 2. Commands
 
@@ -90,7 +92,7 @@ Once per host, by `serverq service install` from the downloaded binary. The lega
 - A failure before step 5 re-enables the legacy timers and leaves `~/.serverq` unchanged. A failure after it prints the exact rollback.
 - Rollback: `service uninstall`, remove the `~/.serverq` link, rename `<install>/legacy` back to `~/.serverq`, `systemctl --user enable --now serverq-check.timer serverq-update.timer`.
 - A second install finds the link and does not migrate. `pin.json`, `update.json` and `versions/` stay in `legacy/` unread.
-- The cutover deletes `serverq.py`, `tools/`, `systemd/`, `release.json` and the Python tests in the same deliverable that ships v1.0.0; the last Python release stays downloadable.
+- The last Python release, v0.2.1, stays downloadable.
 
 ## 7. Windows
 
