@@ -1,6 +1,6 @@
 # serverq contract
 
-serverq checks a Linux server against the agreed server-care rules and reports deviations to agents and monitors. This file is the whole contract of **v1**, the Rust binary built on [coreq](https://github.com/taskqorg/coreq). It follows the [specq release contract](https://github.com/taskqorg/specq/blob/main/engineering/release-contract.md); coreq.md holds the shared update, launcher, service and `status.json` detail. The Python `serverq.py` (0.2.x) stays the shipped version until the cutover in § 6. A change that alters a decision edits this file first, in the same deliverable as the code. No history here; at most 200 lines.
+serverq checks a Linux server against the agreed server-care rules and reports deviations to agents and monitors. This file is the whole contract of **v1**, the Rust binary built on [coreq](https://github.com/taskqorg/coreq). It follows the [specq release contract](https://github.com/taskqorg/specq/blob/main/engineering/release-contract.md); coreq.md holds the shared update, launcher, service and `status.json` detail. v1.0.0 replaces the Python `serverq.py` (0.2.x); § 6 moves a host over. A change that alters a decision edits this file first, in the same deliverable as the code. No history here; at most 200 lines.
 
 ## 1. Principles
 
@@ -18,8 +18,8 @@ serverq checks a Linux server against the agreed server-care rules and reports d
 | `serverq rules` | Prints the embedded `rules.json` bytes unchanged | 0 |
 | `serverq update` | coreq update (§ 4) | coreq |
 | `serverq rollback` | coreq rollback: `previous` into `current`, then `service pause` (§ 4) | coreq |
-| `serverq selftest` | coreq harness: unit checks plus one `check` in a temporary install | 0 or 1 pass; 2 fails |
-| `serverq service install\|run\|pause\|resume\|status\|restart\|stop\|uninstall\|list` | coreq service (§ 5) | coreq |
+| `serverq selftest` | coreq harness: the embedded `rules.json` parses and one `check` in a temporary install, deleted afterwards, completes with a report naming every automated rule, whatever their status | 0 pass; 2 fails |
+| `serverq service install\|run\|pause\|resume\|status\|restart\|stop\|uninstall` | coreq service (§ 5) | 0 done; 2 error or, for `status`, unknown |
 
 - `--home PATH` (every command) replaces the install folder; tests and isolated runs use it.
 - Exit codes and the report schema are the Python ones; a monitor reading either keeps working.
@@ -51,9 +51,9 @@ Checks, in the order of `rules.json`:
 coreq owns all of it; serverq passes tool name `serverq`, install folder and release repository `taskqorg/serverq` as parameters.
 
 - Release: CI on a `v*` tag builds `serverq-<ver>-linux-<arch>` for `x86_64` and `aarch64`, `SHA256SUMS` and `latest.json`. Each artifact passes `selftest` before publishing. One static binary: hosts need no Python, git or toolchain.
-- Install folder `~/.local/share/serverq` (`<install>`): immutable `releases/<ver>/`, `current`, `previous`, the launcher `<install>/serverq`, coreq's `status.json`, plus serverq's `report.json`, `state.json`, `lock`.
-- Update: coreq steps (read `latest.json`, download into `releases/<ver>.tmp/`, verify sha256, `selftest`, swap `current`). Old releases follow coreq retention.
-- Rollback: the launcher restores `previous` after repeated failed starts. A manual `rollback` restores `previous` and pauses updates so the next pass does not reinstall the rolled-back version; `service resume` returns to normal updates.
+- Install folder `~/.local/share/serverq` (`<install>`): immutable `releases/<ver>/`, `current`, `previous`, the launcher `<install>/serverq`, `status.json`, `paused`, plus serverq's `report.json`, `state.json`, `lock`. The repository keeps version `1.0.0-dev`; the tag sets the release version, so a build from a branch is older than any release.
+- Update: coreq steps (read `latest.json`, download into `releases/<ver>.tmp/`, verify sha256, `selftest`, swap `current`). Old release folders stay.
+- Rollback: the launcher restores `previous` after three `service run` starts of a version that never wrote `releases/<ver>/healthy`; `service run` writes it after its first completed check. A manual `rollback` writes `previous` into `current`, swaps them, pauses updates and restarts an installed service; `service resume` returns to normal updates. coreq never reinstalls a version whose folder exists, so a rolled-back release returns only with a newer one.
 - Compatibility N/N-1: a release changes `report.json` and `state.json` only additively; a new schema number needs a cutover task.
 
 Dropped from the Python version, because coreq covers them:
@@ -69,11 +69,11 @@ Dropped from the Python version, because coreq covers them:
 
 One OS unit replaces `serverq-check.service`, `serverq-check.timer`, `serverq-update.service` and `serverq-update.timer`.
 
-- `serverq service install` writes the coreq unit `~/.config/systemd/user/serverq.service` running `<install>/serverq service run`, restarting on failure. A host that must check without a login session needs `loginctl enable-linger <user>` (an operator step; serverq does not run it).
+- `serverq service install` copies the running binary in as coreq `install_self` (current release and launcher), then writes `~/.config/systemd/user/serverq.service` running `<install>/serverq service run --home <install>` with `Restart=always`, `RestartSec=10`, and loads it with `daemon-reload` and `enable --now`. serverq has one unit per host, not one per project, so it fills coreq's `Unit` itself instead of coreq's `<name>-<project>` unit. Linux only; another OS is an error. A host that must check without a login session needs `loginctl enable-linger <user>` (an operator step; serverq does not run it).
 - The unit keeps the Python resource caps and sandbox: `UMask=0077`, `NoNewPrivileges=yes`, `PrivateTmp=yes`, `ProtectSystem=strict`, `ReadWritePaths=<install>`, `MemoryMax=128M`, `TasksMax=32`.
-- `service run` loop: a check 5 min after start, then every `check_every` (3600 s); the coreq update check 15 min after start, then every `update_every` (86400 s). One loop: a check and an update never overlap. A check result 1 is a normal pass, not a service failure.
-- `pause` stops updates only; checks continue, since stopping them would hide deviations. `resume` restarts updates.
-- `status.json` (coreq keys) adds `check`: `at`, `exit`, counts per status, `report` path. Missing, or older than 2 × `check_every`, reads unknown with a reason. `service status` prints `Check: ok|warn|unknown <age>` and `Update: <version|up to date|paused|unknown>`.
+- `service run` loop: a check 5 min after start, then every `check_every` (3600 s); the coreq update check 15 min after start, then every `update_every` (86400 s). Env `SERVERQ_CHECK_EVERY` and `SERVERQ_UPDATE_EVERY` (seconds) override the periods for tests; each first pass waits at most its period. One loop: a check and an update never overlap. A check result 1 is a normal pass, not a service failure. An installed update exits 75 and systemd starts the new `current`. Each pass prints one line to the journal.
+- `pause` writes `<install>/paused` and stops updates only; checks continue, since stopping them would hide deviations. `resume` removes it. `restart`, `stop` and `uninstall` run `systemctl --user restart`, `stop` and `disable --now`; `uninstall` also deletes the unit file, never the install folder.
+- `<install>/status.json` (coreq common keys, `project` `serverq`) adds `check`: `at`, `exit`, counts per status, `report` path, and `update_at`, `paused`. `error` holds the last check or update failure. Missing, unreadable, or a check older than 2 × `check_every`, reads unknown with a reason. `service status` prints `Check: ok|warn|unknown <age>` and `Update: <version|up to date|paused|unknown>`.
 - Monitors read `report.json` or `status.json`; serverq adds no second scheduler, cleaner or notifier.
 
 ## 6. Migration of the legacy layout
@@ -82,7 +82,7 @@ Once per host, by `serverq service install` from the downloaded binary. The lega
 
 1. Take the legacy `~/.serverq/lock`. A `transaction.json` present: refuse; the operator first runs the legacy `check`, which recovers it.
 2. Validate legacy `state.json` and `report.json` (schema 1). Corrupt: refuse, change nothing.
-3. Disable and stop the four legacy units with `systemctl --user disable --now`. Their files stay.
+3. Stop the four legacy units: `systemctl --user disable --now` the two timers, `systemctl --user stop` the two oneshot services, which have no install section. Their files stay.
 4. Copy `state.json` and `report.json` into `<install>`; the new `revision` clears the cache, incidents carry over.
 5. Rename `~/.serverq` to `<install>/legacy/` (never deleted), then link `~/.serverq` to `<install>`, so `~/.serverq/report.json` keeps working for existing monitors.
 6. Install and start `serverq.service`, run one check, print every step done.
@@ -98,4 +98,4 @@ Not built in v1. A later task adds `serverq-<ver>-windows-<arch>`, the coreq Sch
 
 ## 8. Checks
 
-`cargo test --locked`, then `serverq selftest`, then `serverq check --home <temp>` on the authorized host. Tests cover each rule's `ok`/`warn`/`unknown`, cache hit, TTL and revision invalidation, corrupt state, exit codes, and the migration steps against a fake legacy folder.
+`cargo test --locked`, then `serverq selftest`, then `serverq check --home <temp>` on the authorized host. Tests cover each rule's `ok`/`warn`/`unknown`, cache hit, TTL and revision invalidation, corrupt state, exit codes, the migration steps against a fake legacy folder, and update then rollback against a fake release served by a fake `curl`. Linux-only service tests skip elsewhere.

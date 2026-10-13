@@ -20,8 +20,8 @@ checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 
 [[package]]
 name = "coreq"
-version = "0.1.0"
-source = "git+https://github.com/taskqorg/coreq?tag=v0.1.0#d4289cf773f2f5b2dbdd103d140c8f915baff188"
+version = "0.2.0"
+source = "git+https://github.com/taskqorg/coreq?tag=v0.2.0#4725c220d0234c54b58fe5b0663b05999054507a"
 dependencies = [
  "ring",
  "serde_json",
