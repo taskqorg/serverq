@@ -59,6 +59,21 @@ fn real_cli_isolated_state_and_failure() {
     assert!(broken.stdout.is_empty());
     assert!(String::from_utf8_lossy(&broken.stderr).contains("no healthy result claimed"));
     assert_eq!(fs::read_to_string(home.join("state.json")).unwrap(), "broken", "corrupt state is never reset");
+    // serverq.md § 9: every check counts, a failed one with its error class, and the store holds no path
+    let profile = Command::new(env!("CARGO_BIN_EXE_serverq")).args(["profile", "--home"]).arg(&home).output().unwrap();
+    assert_eq!(profile.status.code(), Some(0));
+    let p: Value = serde_json::from_slice(&profile.stdout).unwrap();
+    let row = p["operations"].as_array().unwrap().iter().find(|o| o["op"] == "cli.check").unwrap();
+    assert_eq!(row["count"], if r["results"]["bounded-journal"]["status"] != "unknown" { 5 } else { 4 });
+    assert_eq!(row["errors"]["invalid-state"], 1);
+    assert!(!fs::read_to_string(home.join("profile.json")).unwrap().contains(home.to_str().unwrap()));
+    // an argument parse failure counts as cli.other
+    let bad = Command::new(env!("CARGO_BIN_EXE_serverq")).args(["--bad", "--home"]).arg(&home).output().unwrap();
+    assert_eq!(bad.status.code(), Some(2));
+    let profile = Command::new(env!("CARGO_BIN_EXE_serverq")).args(["profile", "--home"]).arg(&home).output().unwrap();
+    let p: Value = serde_json::from_slice(&profile.stdout).unwrap();
+    let row = p["operations"].as_array().unwrap().iter().find(|o| o["op"] == "cli.other").unwrap();
+    assert_eq!((row["count"].as_u64(), row["errors"]["error"].as_u64()), (Some(1), Some(1)));
 }
 
 #[test]

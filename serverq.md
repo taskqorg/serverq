@@ -21,6 +21,7 @@ serverq checks a Linux server against the agreed server-care rules and reports d
 | `serverq check [--force] [--filesystem PATH]` | One audit (§ 3); prints the report JSON and writes `report.json` | 0 all automated checks `ok`; 1 completed with a `warn`; 2 any `unknown`, collection or state failure |
 | `serverq rules` | Prints the embedded `rules.json` bytes unchanged | 0 |
 | `serverq projection` | Prints the allowlisted projection of `report.json` (§ 3); never runs a check | 0; 2 no or invalid report, invalid identity |
+| `serverq profile` | Prints the profile report (§ 9); never runs a check | 0; 2 unreadable profile |
 | `serverq update` | coreq update (§ 4) | coreq |
 | `serverq rollback` | coreq rollback: `previous` into `current`, then `service pause` (§ 4) | coreq |
 | `serverq selftest` | coreq harness: the embedded `rules.json` parses and one `check` in a temporary install, deleted afterwards, completes with a report naming every automated rule, whatever their status | 0 pass; 2 fails |
@@ -58,7 +59,7 @@ Checks, in the order of `rules.json`:
 coreq owns all of it; serverq passes tool name `serverq`, install folder and release repository `taskqorg/serverq` as parameters.
 
 - Release: CI on a `v*` tag builds `serverq-<ver>-linux-<arch>` for `x86_64` and `aarch64` and `serverq-<ver>-windows-x86_64.exe` (§ 7), `SHA256SUMS` and `latest.json`. Each artifact passes `selftest` before publishing. A separate job with only `id-token: write` and `attestations: write` attests each binary and `SHA256SUMS` with `actions/attest-build-provenance` (pinned by commit SHA) before the release is created; installers and the update keep the sha256 check. One static binary: hosts need no Python, git or toolchain.
-- Install folder `~/.local/share/serverq` (`<install>`): immutable `releases/<ver>/`, `current`, `previous`, the launcher `<install>/serverq`, `status.json`, `paused`, plus serverq's `report.json`, `state.json`, `installation`, `lock`. The repository keeps version `1.0.0-dev`; the tag sets the release version, so a build from a branch is older than any release.
+- Install folder `~/.local/share/serverq` (`<install>`): immutable `releases/<ver>/`, `current`, `previous`, the launcher `<install>/serverq`, `status.json`, `paused`, plus serverq's `report.json`, `state.json`, `installation`, `lock`, `profile.json`, `trace`, `trace.jsonl`. The repository keeps version `1.0.0-dev`; the tag sets the release version, so a build from a branch is older than any release.
 - Update: coreq steps (read `latest.json`, download into `releases/<ver>.tmp/`, verify sha256, `selftest`, swap `current`). Each update prunes `releases/` to `current` and `previous`; a folder in use stays until the next update.
 - Rollback: the launcher restores `previous` after three `service run` starts of a version that never wrote `releases/<ver>/healthy`; `service run` writes it after its first completed check. A manual `rollback` writes `previous` into `current`, swaps them, pauses updates and restarts an installed service; `service resume` returns to normal updates. coreq never reinstalls a version whose folder exists, so a rolled-back release returns only with a newer one.
 - Compatibility N/N-1: a release changes `report.json` and `state.json` only additively; a new schema number needs a cutover task.
@@ -113,3 +114,25 @@ A Windows host runs the service and reports the Linux-only rules as unknown; Win
 ## 8. Checks
 
 `cargo test --locked`, then `serverq selftest`, then `serverq check --home <temp>` on the authorized host. Tests cover each rule's `ok`/`warn`/`unknown`, cache hit, TTL and revision invalidation, corrupt state, exit codes, the migration steps against a fake legacy folder, and update then rollback against a fake release served by a fake `curl`. Linux-only service tests compile only on Linux; on other OSes the CLI test asserts `unsupported-os`. CI runs the tests on Linux and Windows; the Scheduled Task is verified on the authorized Windows host.
+
+## 9. Profiling
+
+serverq follows [specq built-in profiling](https://github.com/taskqorg/specq/blob/main/engineering/profiling.md). Measured operations and budgets (p95 time, failure rate):
+
+| Group | Operation | p95 | Failures |
+|---|---|---|---|
+| Request handling: one CLI command | `cli.check` | 5 s | 1% |
+| | `cli.projection` | 0.5 s | 1% |
+| | `cli.update` | 60 s | 5% |
+| | `cli.rules`, `cli.rollback`, `cli.service` (every `service` command except `run`), `cli.other` (usage errors, including unparsable arguments) | 5 s | 1% |
+| Service lifecycle: one `service run` pass | `service.check` | 5 s | 1% |
+| | `service.update` | 60 s | 5% |
+| Upstream calls: one probe | `probe.statvfs` | 0.1 s | 1% |
+| | `probe.systemctl`, `probe.systemd-analyze` | 2 s | 1% |
+| | `probe.docker` (each docker CLI call) | 5 s | 1% |
+
+- Counters are always on. Each process keeps its samples in memory and merges them into `<install>/profile.json` when its command or service pass ends, only when `<install>` already exists; `selftest` records nothing. Concurrent writers may lose a sample, never corrupt the file.
+- `profile.json` schema 1, per operation: `count`, `failed`, `errors` (class to count), `first`, `last` (Unix seconds) and `ms`, the last 200 durations. Each merge rebuilds the file from valid records of the operation names above with only these fields, so the file stays bounded and foreign content is dropped. A record is malformed when an error class is not listed below, error counts do not sum to `failed`, `failed` exceeds `count`, it holds more durations than `count` or 200, or a duration or time is negative, non-finite or `first` is after `last`. An unreadable file or malformed record is replaced by the next merge.
+- An outcome is `ok` or `failed` with an error class: `timeout`, `exit-nonzero`, `not-found`, `lock-busy`, `invalid-state`, `unknown-result` (a `check` that completed with an `unknown` rule) or `error`. serverq never retries, so no operation counts as retried. No message text, path, unit name or container ID is stored.
+- Detailed traces: while the file `<install>/trace` exists, each merge also appends one line per call to `<install>/trace.jsonl` (`op`, `at`, `ms`, `error`), pruned to the last 1000 lines. Off by default; delete `trace` to stop.
+- `serverq profile` ranks every named operation worst first: the larger of p95 over budget and failure rate over budget, then instability (p95 over p50). Each row has `count`, `samples`, `failure_rate`, `p50_ms`, `p95_ms`, `max_ms`, budgets, `errors` and `status` `ok|over-budget|failing|unknown`. An operation without samples reads `unknown` with `reason: no-samples`, a malformed record with `reason: corrupt-record`; neither reads as zero. The report names the window (`from`, `to`) and whether traces are on.
