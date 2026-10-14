@@ -249,13 +249,15 @@ fn end(t: &coreq::Tool) -> Result<(), String> {
     }
     coreq::service::run_all(&unit(t).stop, true)?;
     // ponytail: PowerShell CIM, the one stock tool that lists processes with their paths; no double quotes, which the
-    // Windows command line would mangle
+    // Windows command line would mangle. Stop-Process does not wait for the exit, so wait up to 5 s before calling a
+    // process a survivor.
     let script = format!(
         "$me = {pid}; $up = (Get-CimInstance Win32_Process -Filter ('ProcessId=' + $me)).ParentProcessId; \
          $mine = {{ Get-CimInstance Win32_Process -Filter 'Name=''serverq.exe''' | \
          Where-Object {{ $_.ProcessId -notin @($me, $up) -and ([string]$_.ExecutablePath).StartsWith('{dir}\\', 'OrdinalIgnoreCase') }} }}; \
          & $mine | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue; 'ended ' + $_.ProcessId + ' ' + $_.ExecutablePath }}; \
-         if (& $mine) {{ 'serverq processes of the install folder survived'; exit 1 }}",
+         foreach ($i in 1..20) {{ if (-not (& $mine)) {{ exit 0 }}; Start-Sleep -Milliseconds 250 }}; \
+         'serverq processes of the install folder survived'; exit 1",
         pid = std::process::id(),
         dir = t.install.display().to_string().replace('\'', "''")
     );
