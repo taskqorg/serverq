@@ -9,10 +9,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod profile;
+
 const RULES: &[u8] = include_bytes!("../rules.json");
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DOCKER: [&str; 3] = ["docker", "--host", "unix:///var/run/docker.sock"];
-const USAGE: &str = "usage: serverq check [--force] [--filesystem PATH] | rules | projection | update | rollback | selftest | service install|run|pause|resume|status|restart|stop|uninstall; every command takes --home PATH";
+const USAGE: &str = "usage: serverq check [--force] [--filesystem PATH] | rules | projection | profile | update | rollback | selftest | service install|run|pause|resume|status|restart|stop|uninstall; every command takes --home PATH";
 const UNIT: &str = "serverq.service";
 const LEGACY_UNITS: [&str; 4] = ["serverq-check.timer", "serverq-update.timer", "serverq-check.service", "serverq-update.service"];
 const LINUX: bool = cfg!(target_os = "linux");
@@ -77,9 +79,32 @@ fn run(args: &[String]) -> Result<i32, String> {
             _ => words.push(a.as_str()),
         }
     }
-    match words[..] {
+    let op = match words[..] {
+        [w @ ("check" | "rules" | "projection" | "update" | "rollback")] => format!("cli.{w}"),
+        ["selftest" | "profile"] | ["service", "run"] => String::new(),
+        ["service", _] => "cli.service".into(),
+        _ => "cli.other".into(),
+    };
+    let start = Instant::now();
+    let result = dispatch(&t, &words, &filesystem, force);
+    if op.is_empty() {
+        profile::discard();
+    } else {
+        let error = match &result {
+            Err(e) => Some(profile::class(e)),
+            Ok(2) => Some("unknown-result"),
+            _ => None,
+        };
+        profile::record(&op, start, error);
+        profile::flush(&t.install);
+    }
+    result
+}
+
+fn dispatch(t: &coreq::Tool, words: &[&str], filesystem: &str, force: bool) -> Result<i32, String> {
+    match words {
         ["check"] => {
-            let (code, report) = check(&t.install, &filesystem, force)?;
+            let (code, report) = check(&t.install, filesystem, force)?;
             println!("{}", pretty(&report));
             Ok(code)
         }
@@ -93,15 +118,16 @@ fn run(args: &[String]) -> Result<i32, String> {
             Ok(0)
         }
         ["update"] => {
-            match coreq::update::update(&t, false)? {
+            match coreq::update::update(t, false)? {
                 Some(v) => println!("serverq: updated to {v}"),
                 None => println!("serverq: up to date"),
             }
             Ok(0)
         }
-        ["rollback"] => rollback(&t),
+        ["rollback"] => rollback(t),
         ["selftest"] => selftest(),
-        ["service", cmd] => service(&t, cmd),
+        ["profile"] => profile::print(&t.install),
+        ["service", cmd] => service(t, cmd),
         _ => Err(USAGE.into()),
     }
 }
@@ -361,7 +387,15 @@ fn serve(t: &coreq::Tool) -> Result<i32, String> {
         let paused = t.install.join("paused").exists();
         if Instant::now() >= next_check {
             next_check += check_every;
-            match check(&t.install, "/", false) {
+            let start = Instant::now();
+            let result = check(&t.install, "/", false);
+            let error = match &result {
+                Err(e) => Some(profile::class(e)),
+                Ok((2, _)) => Some("unknown-result"),
+                _ => None,
+            };
+            profile::record("service.check", start, error);
+            match result {
                 Ok((code, report)) => {
                     let mut counts = Obj::new();
                     for (_, r) in report["results"].as_object().into_iter().flatten() {
@@ -388,7 +422,11 @@ fn serve(t: &coreq::Tool) -> Result<i32, String> {
             if paused {
                 println!("serverq: update paused");
             } else {
-                match coreq::update::update(t, false) {
+                let start = Instant::now();
+                let result = coreq::update::update(t, false);
+                profile::record("service.update", start, result.as_ref().err().map(|e| profile::class(e)));
+                profile::flush(&t.install);
+                match result {
                     Ok(Some(v)) => {
                         println!("serverq: updated to {v}; restarting");
                         return Ok(75);
@@ -404,6 +442,7 @@ fn serve(t: &coreq::Tool) -> Result<i32, String> {
                 }
             }
         }
+        profile::flush(&t.install);
         let error = [&check_error, &update_error].into_iter().flatten().cloned().collect::<Vec<_>>();
         let mut s = coreq::status::common(t, &host, "serverq", now() as u64, (!error.is_empty()).then(|| error.join("; ")), None);
         s["check"] = check_status.clone();
@@ -461,7 +500,12 @@ fn audit(home: &Path, filesystem: &str, force: bool) -> Result<Value, String> {
         state.insert("cache".into(), json!({}));
     }
     let mut results = Obj::new();
-    match statvfs(filesystem) {
+    let start = Instant::now();
+    let fs_usage = statvfs(filesystem);
+    if fs_usage.as_ref().err().is_none_or(|e| e != UNSUPPORTED) {
+        profile::record("probe.statvfs", start, fs_usage.as_ref().err().map(|e| profile::class(e)));
+    }
+    match fs_usage {
         Ok([total, free, files, favail]) => {
             results.insert("disk-headroom".into(), capacity(total, free, number("disk-headroom", "minimum_percent")?));
             results.insert("inode-headroom".into(), capacity(files, favail, number("inode-headroom", "minimum_percent")?));
@@ -613,8 +657,16 @@ fn statvfs(path: &str) -> Result<[u64; 4], String> {
     Ok([s.f_blocks as u64 * block, s.f_bavail as u64 * block, s.f_files as u64, s.f_favail as u64])
 }
 
-/// Runs without a shell, 15 s timeout; spawn failure, nonzero exit or timeout is an error.
+/// One profiled probe call (`probe.<program>`, serverq.md § 9).
 fn command(argv: &[&str]) -> Result<String, String> {
+    let start = Instant::now();
+    let r = run_probe(argv);
+    profile::record(&format!("probe.{}", argv[0]), start, r.as_ref().err().map(|e| profile::class(e)));
+    r
+}
+
+/// Runs without a shell, 15 s timeout; spawn failure, nonzero exit or timeout is an error.
+fn run_probe(argv: &[&str]) -> Result<String, String> {
     let fail = |why: String| format!("{} collection failed: {why}", argv[0]);
     let mut child = Command::new(argv[0]).args(&argv[1..]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().map_err(|e| fail(format!("{:?}", e.kind())))?;
     let mut out = child.stdout.take().ok_or_else(|| fail("no stdout".into()))?;
