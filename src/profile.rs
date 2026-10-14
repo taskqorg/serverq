@@ -22,6 +22,8 @@ pub const BUDGETS: [(&str, f64, f64); 13] = [
     ("probe.systemd-analyze", 2000.0, 0.01),
     ("probe.docker", 5000.0, 0.01),
 ];
+/// Every error class `class` and the callers produce; a stored record with any other key is corrupt.
+const ERRORS: [&str; 7] = ["timeout", "exit-nonzero", "not-found", "lock-busy", "invalid-state", "unknown-result", "error"];
 const SAMPLES: usize = 200;
 const TRACE_LINES: usize = 1000;
 
@@ -74,27 +76,31 @@ pub fn flush(home: &Path) {
     }
     let path = home.join("profile.json");
     // ponytail: read-merge-write without a lock; a concurrent writer can lose a sample, add a lock if that ever matters
-    let mut ops = match fs::read(&path).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()) {
+    let old = match fs::read(&path).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()) {
         Some(v) if v["schema"] == 1 && v["ops"].is_object() => v["ops"].as_object().cloned().unwrap_or_default(),
         _ => Obj::new(),
     };
+    // rebuilt from valid records of named operations only: unknown names, fields and corrupt records are dropped
+    let mut ops: Vec<(&str, Record)> = BUDGETS.iter().filter_map(|b| Some((b.0, old.get(b.0).and_then(parse)?))).collect();
     for s in &spans {
-        let entry = ops.entry(s.op.clone()).or_insert(Value::Null);
-        if parse(entry).is_none() {
-            *entry = json!({"count": 0, "failed": 0, "errors": {}, "first": s.at, "ms": []});
-        }
-        entry["count"] = (entry["count"].as_u64().unwrap_or(0) + 1).into();
-        entry["last"] = s.at.into();
+        let i = ops.iter().position(|o| o.0 == s.op).unwrap_or_else(|| {
+            let name = BUDGETS.iter().find(|b| b.0 == s.op).map_or("", |b| b.0);
+            ops.push((name, Record { count: 0, failed: 0, errors: Obj::new(), first: s.at, last: s.at, ms: vec![] }));
+            ops.len() - 1
+        });
+        let r = &mut ops[i].1;
+        r.count += 1;
+        r.last = r.last.max(s.at);
         if let Some(c) = s.error {
-            entry["failed"] = (entry["failed"].as_u64().unwrap_or(0) + 1).into();
-            entry["errors"][c] = (entry["errors"][c].as_u64().unwrap_or(0) + 1).into();
+            r.failed += 1;
+            let n = r.errors.get(c).and_then(Value::as_u64).unwrap_or(0) + 1;
+            r.errors.insert(c.into(), n.into());
         }
-        if let Some(ms) = entry["ms"].as_array_mut() {
-            ms.push(((s.ms * 1000.0).round() / 1000.0).into());
-            let extra = ms.len().saturating_sub(SAMPLES);
-            ms.drain(..extra);
-        }
+        r.ms.push((s.ms.max(0.0) * 1000.0).round() / 1000.0);
+        let extra = r.ms.len().saturating_sub(SAMPLES);
+        r.ms.drain(..extra);
     }
+    let ops: Obj = ops.into_iter().map(|(op, r)| (op.to_string(), json!({"count": r.count, "failed": r.failed, "errors": r.errors, "first": r.first, "last": r.last, "ms": r.ms}))).collect();
     let _ = save_json(&path, &json!({"schema": 1, "ops": ops}));
     if home.join("trace").exists() {
         let p = home.join("trace.jsonl");
@@ -106,11 +112,35 @@ pub fn flush(home: &Path) {
     }
 }
 
-/// A well-formed record: `(count, failed, durations)`.
-fn parse(r: &Value) -> Option<(u64, u64, Vec<f64>)> {
-    let ms: Option<Vec<f64>> = r["ms"].as_array()?.iter().map(Value::as_f64).collect();
-    let (count, failed) = (r["count"].as_u64()?, r["failed"].as_u64()?);
-    (r["errors"].is_object() && r["first"].is_number() && failed <= count).then_some((count, failed, ms?))
+struct Record {
+    count: u64,
+    failed: u64,
+    errors: Obj,
+    first: f64,
+    last: f64,
+    ms: Vec<f64>,
+}
+
+/// A consistent record, or `None`: unknown error classes, error counts not summing to `failed`, more samples than calls
+/// or than kept, and negative, non-finite or out-of-order values are all corrupt.
+fn parse(r: &Value) -> Option<Record> {
+    let ok = |x: f64| x.is_finite() && x >= 0.0;
+    let ms: Vec<f64> = r["ms"].as_array()?.iter().map(Value::as_f64).collect::<Option<_>>()?;
+    let errors = r["errors"].as_object()?.clone();
+    let mut sum = 0u64;
+    for (k, v) in &errors {
+        sum = sum.checked_add(v.as_u64().filter(|n| *n > 0 && ERRORS.contains(&k.as_str()))?)?;
+    }
+    let rec = Record { count: r["count"].as_u64()?, failed: r["failed"].as_u64()?, errors, first: r["first"].as_f64()?, last: r["last"].as_f64()?, ms };
+    let valid = rec.failed <= rec.count
+        && sum == rec.failed
+        && rec.ms.len() as u64 <= rec.count
+        && rec.ms.len() <= SAMPLES
+        && rec.ms.iter().all(|m| ok(*m))
+        && ok(rec.first)
+        && ok(rec.last)
+        && rec.first <= rec.last;
+    valid.then_some(rec)
 }
 
 fn percentile(sorted: &[f64], p: f64) -> f64 {
@@ -141,18 +171,17 @@ pub fn report(home: &Path) -> Result<Value, String> {
             None => unknown("no-samples"),
             Some(r) => match parse(r) {
                 None => unknown("corrupt-record"),
-                Some((_, _, ms)) if ms.is_empty() => unknown("no-samples"),
-                Some((count, failed, mut ms)) => {
+                Some(rec) if rec.ms.is_empty() => unknown("no-samples"),
+                Some(Record { count, failed, errors, first, last, mut ms }) => {
                     ms.sort_by(f64::total_cmp);
                     let (p50, p95, max) = (percentile(&ms, 0.5), percentile(&ms, 0.95), ms[ms.len() - 1]);
                     let rate = failed as f64 / count as f64;
                     let (slow, failing) = (p95 / p95_budget, rate / fail_budget);
                     let instability = if p50 > 0.0 { p95 / p50 } else { 1.0 };
-                    from = from.min(r["first"].as_f64().unwrap_or(from));
-                    to = to.max(r["last"].as_f64().unwrap_or(to));
+                    (from, to) = (from.min(first), to.max(last));
                     let status = if failing > 1.0 { "failing" } else if slow > 1.0 { "over-budget" } else { "ok" };
                     let mut row = base.clone();
-                    for (k, v) in [("status", json!(status)), ("count", count.into()), ("samples", ms.len().into()), ("failure_rate", rate.into()), ("p50_ms", p50.into()), ("p95_ms", p95.into()), ("max_ms", max.into()), ("instability", instability.into()), ("errors", r["errors"].clone())] {
+                    for (k, v) in [("status", json!(status)), ("count", count.into()), ("samples", ms.len().into()), ("failure_rate", rate.into()), ("p50_ms", p50.into()), ("p95_ms", p95.into()), ("max_ms", max.into()), ("instability", instability.into()), ("errors", errors.into())] {
                         row[k] = v;
                     }
                     (slow.max(failing), instability, row)
@@ -225,6 +254,30 @@ mod tests {
         record("probe.statvfs", t, None);
         flush(&home);
         assert_eq!(row(&report(&home).unwrap(), "probe.statvfs")["count"], 1);
+
+        // inconsistent records read corrupt, and a merge keeps only named operations, known fields and error classes
+        let good = json!({"count": 2, "failed": 1, "errors": {"timeout": 1}, "first": 1.0, "last": 2.0, "ms": [1.0, 2.0]});
+        let mut cases = vec![];
+        for (k, v) in [("count", json!(0)), ("ms", json!([-1.0])), ("errors", json!({"/secret/path": 1})), ("errors", json!({})), ("first", json!(3.0)), ("ms", json!(vec![1.0; SAMPLES + 1]))] {
+            let mut r = good.clone();
+            r[k] = v;
+            if k == "ms" {
+                r["count"] = (SAMPLES as u64 + 1).into();
+            }
+            cases.push(r);
+        }
+        for case in cases {
+            let mut leaky = json!({"schema": 1, "ops": {"cli.rules": good, "probe.docker": case, "/home/u/x": good}});
+            leaky["ops"]["cli.rules"]["note"] = "/home/u/x".into();
+            fs::write(home.join("profile.json"), leaky.to_string()).unwrap();
+            assert_eq!(row(&report(&home).unwrap(), "probe.docker")["reason"], "corrupt-record", "{case}");
+            assert_eq!(row(&report(&home).unwrap(), "cli.rules")["status"], "failing");
+            record("probe.statvfs", t, None);
+            flush(&home);
+            let kept = fs::read_to_string(home.join("profile.json")).unwrap();
+            assert!(!kept.contains("/home/u/x") && !kept.contains("secret") && !kept.contains("probe.docker"), "{kept}");
+            assert_eq!(row(&report(&home).unwrap(), "cli.rules")["count"], 2);
+        }
 
         fs::write(home.join("profile.json"), "broken").unwrap();
         assert!(report(&home).unwrap_err().contains("invalid profile"));

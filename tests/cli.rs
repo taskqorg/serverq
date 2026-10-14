@@ -67,6 +67,13 @@ fn real_cli_isolated_state_and_failure() {
     assert_eq!(row["count"], if r["results"]["bounded-journal"]["status"] != "unknown" { 5 } else { 4 });
     assert_eq!(row["errors"]["invalid-state"], 1);
     assert!(!fs::read_to_string(home.join("profile.json")).unwrap().contains(home.to_str().unwrap()));
+    // an argument parse failure counts as cli.other
+    let bad = Command::new(env!("CARGO_BIN_EXE_serverq")).args(["--bad", "--home"]).arg(&home).output().unwrap();
+    assert_eq!(bad.status.code(), Some(2));
+    let profile = Command::new(env!("CARGO_BIN_EXE_serverq")).args(["profile", "--home"]).arg(&home).output().unwrap();
+    let p: Value = serde_json::from_slice(&profile.stdout).unwrap();
+    let row = p["operations"].as_array().unwrap().iter().find(|o| o["op"] == "cli.other").unwrap();
+    assert_eq!((row["count"].as_u64(), row["errors"]["error"].as_u64()), (Some(1), Some(1)));
 }
 
 #[test]

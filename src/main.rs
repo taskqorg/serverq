@@ -68,25 +68,33 @@ fn run(args: &[String]) -> Result<i32, String> {
     if me.is_some() && me == fs::canonicalize(t.install.join(t.exe_name())).ok() {
         coreq::launcher::launch(&t, args);
     }
+    let start = Instant::now();
     let (mut words, mut filesystem, mut force) = (vec![], "/".to_string(), false);
     let mut it = args.iter();
+    let mut parsed = Ok(());
     while let Some(a) = it.next() {
         match a.as_str() {
             "--home" => _ = it.next(),
-            "--filesystem" => filesystem = it.next().ok_or(USAGE)?.clone(),
+            "--filesystem" => match it.next() {
+                Some(f) => filesystem = f.clone(),
+                None => parsed = Err(USAGE.to_string()),
+            },
             "--force" => force = true,
-            _ if a.starts_with("--") => return Err(format!("unknown argument {a}; {USAGE}")),
+            _ if a.starts_with("--") => parsed = Err(format!("unknown argument {a}; {USAGE}")),
             _ => words.push(a.as_str()),
+        }
+        if parsed.is_err() {
+            break;
         }
     }
     let op = match words[..] {
+        _ if parsed.is_err() => "cli.other".into(),
         [w @ ("check" | "rules" | "projection" | "update" | "rollback")] => format!("cli.{w}"),
         ["selftest" | "profile"] | ["service", "run"] => String::new(),
         ["service", _] => "cli.service".into(),
         _ => "cli.other".into(),
     };
-    let start = Instant::now();
-    let result = dispatch(&t, &words, &filesystem, force);
+    let result = parsed.and_then(|()| dispatch(&t, &words, &filesystem, force));
     if op.is_empty() {
         profile::discard();
     } else {

@@ -124,7 +124,7 @@ serverq follows [specq built-in profiling](https://github.com/taskqorg/specq/blo
 | Request handling: one CLI command | `cli.check` | 5 s | 1% |
 | | `cli.projection` | 0.5 s | 1% |
 | | `cli.update` | 60 s | 5% |
-| | `cli.rules`, `cli.rollback`, `cli.service` (every `service` command except `run`), `cli.other` (usage errors) | 5 s | 1% |
+| | `cli.rules`, `cli.rollback`, `cli.service` (every `service` command except `run`), `cli.other` (usage errors, including unparsable arguments) | 5 s | 1% |
 | Service lifecycle: one `service run` pass | `service.check` | 5 s | 1% |
 | | `service.update` | 60 s | 5% |
 | Upstream calls: one probe | `probe.statvfs` | 0.1 s | 1% |
@@ -132,7 +132,7 @@ serverq follows [specq built-in profiling](https://github.com/taskqorg/specq/blo
 | | `probe.docker` (each docker CLI call) | 5 s | 1% |
 
 - Counters are always on. Each process keeps its samples in memory and merges them into `<install>/profile.json` when its command or service pass ends, only when `<install>` already exists; `selftest` records nothing. Concurrent writers may lose a sample, never corrupt the file.
-- `profile.json` schema 1, per operation: `count`, `failed`, `errors` (class to count), `first`, `last` (Unix seconds) and `ms`, the last 200 durations. Only the operation names above are stored, so the file stays bounded. An unreadable file or record is replaced by the next merge.
+- `profile.json` schema 1, per operation: `count`, `failed`, `errors` (class to count), `first`, `last` (Unix seconds) and `ms`, the last 200 durations. Each merge rebuilds the file from valid records of the operation names above with only these fields, so the file stays bounded and foreign content is dropped. A record is malformed when an error class is not listed below, error counts do not sum to `failed`, `failed` exceeds `count`, it holds more durations than `count` or 200, or a duration or time is negative, non-finite or `first` is after `last`. An unreadable file or malformed record is replaced by the next merge.
 - An outcome is `ok` or `failed` with an error class: `timeout`, `exit-nonzero`, `not-found`, `lock-busy`, `invalid-state`, `unknown-result` (a `check` that completed with an `unknown` rule) or `error`. serverq never retries, so no operation counts as retried. No message text, path, unit name or container ID is stored.
 - Detailed traces: while the file `<install>/trace` exists, each merge also appends one line per call to `<install>/trace.jsonl` (`op`, `at`, `ms`, `error`), pruned to the last 1000 lines. Off by default; delete `trace` to stop.
 - `serverq profile` ranks every named operation worst first: the larger of p95 over budget and failure rate over budget, then instability (p95 over p50). Each row has `count`, `samples`, `failure_rate`, `p50_ms`, `p95_ms`, `max_ms`, budgets, `errors` and `status` `ok|over-budget|failing|unknown`. An operation without samples reads `unknown` with `reason: no-samples`, a malformed record with `reason: corrupt-record`; neither reads as zero. The report names the window (`from`, `to`) and whether traces are on.
