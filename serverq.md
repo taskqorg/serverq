@@ -23,7 +23,7 @@ serverq checks a Linux server against the agreed server-care rules and reports d
 | `serverq projection` | Prints the allowlisted projection of `report.json` (§ 3); never runs a check | 0; 2 no or invalid report, invalid identity |
 | `serverq profile` | Prints the profile report (§ 9); never runs a check | 0; 2 unreadable profile |
 | `serverq enroll <https-url> [--headless]` | coreq pairing: one browser approval (`--headless` only prints the link and code), then sends the current projection and polls its receipt every 2 s for at most 60 s; never runs a check | 0 `Connected` (receipt `projected`); 2 not verified (the connection stays, the service retries) or error |
-| `serverq connection status` | Prints `Connection: none\|pending\|active\|disconnected`, destination, workspace and generation, `Snapshot: <event> unsent\|accepted\|projected` and pending revokes; never a credential | 0 none, or active with its last snapshot `projected`; 2 otherwise |
+| `serverq connection status` | Prints `Connection: none\|pending\|active\|disconnected`, destination, workspace and generation, `Snapshot: <event> unsent\|accepted\|projected`, or `Snapshot: unknown (<reason>)` when `snapshot.json` or `sent.json` is present but unreadable (kept for investigation, never read past to an older receipt), and pending revokes; never a credential | 0 none, or active with its last snapshot `projected`; 2 otherwise |
 | `serverq disconnect` | Stops sending at once and revokes through coreq | 0 revoked or never connected; 1 `Disconnected locally; revocation pending`; 2 error |
 | `serverq update` | coreq update (§ 4) | coreq |
 | `serverq rollback` | coreq rollback: `previous` into `current`, then `service pause` (§ 4) | coreq |

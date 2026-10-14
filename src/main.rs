@@ -601,15 +601,25 @@ fn connection_status(home: &Path, wire: &mut dyn coreq::enroll::Wire) -> Result<
     match coreq::enroll::active(&dir)? {
         Some(a) => {
             println!("Connection: active {} workspace {} generation {}", a["destination"].as_str().unwrap_or("?"), a["workspace"].as_str().unwrap_or("?"), a["generation"]);
-            let read = |f: &str| fs::read(dir.join(f)).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok());
-            if let Some(r) = read("snapshot.json") {
-                println!("Snapshot: {} unsent", r["event_id"].as_str().unwrap_or_default());
-            } else if let Some(r) = read("sent.json") {
-                let state = coreq::enroll::receipt(&dir, &r, wire).map(String::from).unwrap_or_else(|e| format!("unknown ({e})"));
-                code = if state == "projected" { 0 } else { 2 };
-                println!("Snapshot: {} {state}", r["event_id"].as_str().unwrap_or_default());
-            } else {
-                println!("Snapshot: none yet");
+            // absent reads None; a present but unreadable record is an error, kept and never read past to an older receipt
+            let read = |f: &str| match fs::read(dir.join(f)) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(format!("{f}: {e}")),
+                Ok(b) => serde_json::from_slice::<Value>(&b).map(Some).map_err(|_| format!("{f}: unreadable")),
+            };
+            let last = match read("snapshot.json") {
+                Ok(None) => read("sent.json").map(|r| r.map(|r| (r, true))),
+                r => r.map(|r| r.map(|r| (r, false))),
+            };
+            match last {
+                Ok(Some((r, false))) => println!("Snapshot: {} unsent", r["event_id"].as_str().unwrap_or_default()),
+                Ok(Some((r, true))) => {
+                    let state = coreq::enroll::receipt(&dir, &r, wire).map(String::from).unwrap_or_else(|e| format!("unknown ({e})"));
+                    code = if state == "projected" { 0 } else { 2 };
+                    println!("Snapshot: {} {state}", r["event_id"].as_str().unwrap_or_default());
+                }
+                Ok(None) => println!("Snapshot: none yet"),
+                Err(e) => println!("Snapshot: unknown ({e})"),
             }
         }
         None if s["pending"].is_object() => println!("Connection: pending approval at {}", s["pending"]["destination"].as_str().unwrap_or("?")),
@@ -1451,6 +1461,14 @@ mod tests {
         assert!(connection_pass(&home, true, &mut backoff, &mut dash).is_some());
         assert_eq!(connection_status(&home, &mut dash), Ok(2), "unsent is not connected");
         dash.online = true;
+        // a corrupt unsent record over an older projected receipt reads unknown and stays for investigation
+        let unsent = home.join("connection/snapshot.json");
+        let (kept, older) = (fs::read(&unsent).unwrap(), home.join("connection/sent.json"));
+        assert!(older.exists(), "an older projected receipt is present");
+        fs::write(&unsent, b"{corrupt").unwrap();
+        assert_eq!(connection_status(&home, &mut dash), Ok(2), "corrupt is unknown, not the older projected receipt");
+        assert_eq!(fs::read(&unsent).unwrap(), b"{corrupt", "the corrupt record is kept");
+        fs::write(&unsent, kept).unwrap();
         assert_eq!(connection_pass(&home, false, &mut backoff, &mut dash), None);
         assert_eq!(dash.events.iter().map(|e| e.2["observed_at"].as_u64().unwrap()).collect::<Vec<_>>(), [100, 300], "coalesced");
 
