@@ -14,13 +14,15 @@ mod profile;
 const RULES: &[u8] = include_bytes!("../rules.json");
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DOCKER: [&str; 3] = ["docker", "--host", "unix:///var/run/docker.sock"];
-const USAGE: &str = "usage: serverq check [--force] [--filesystem PATH] | rules | projection | profile | update | rollback | selftest | service install|run|pause|resume|status|restart|stop|uninstall; every command takes --home PATH";
+const USAGE: &str = "usage: serverq check [--force] [--filesystem PATH] | rules | projection | enroll URL [--headless] | connection status | disconnect | profile | update | rollback | selftest | service install|run|pause|resume|status|restart|stop|uninstall; every command takes --home PATH";
 const UNIT: &str = "serverq.service";
 const LEGACY_UNITS: [&str; 4] = ["serverq-check.timer", "serverq-update.timer", "serverq-check.service", "serverq-update.service"];
 const LINUX: bool = cfg!(target_os = "linux");
 const UNSUPPORTED: &str = "unsupported-os";
 /// coreq's Windows unit for project `serverq`: `<title>-<project>`.
 const TASK: &str = "ServerQ-serverq";
+/// The one schema a ServerQ grant covers (coreq-enrollment/1, DashQ C3).
+const SCHEMA: &str = "serverq-report/1";
 /// Fixed `reason` vocabulary of non-`ok` results; the projection exports nothing else (docs/design/enrollment.md).
 const REASONS: [&str; 9] = [UNSUPPORTED, COLLECTION, "capacity-unavailable", "below-minimum", "failed-units", "missing-journal-bounds", "docker-cli-missing", "unsupported-log-driver", "missing-rotation"];
 
@@ -69,7 +71,7 @@ fn run(args: &[String]) -> Result<i32, String> {
         coreq::launcher::launch(&t, args);
     }
     let start = Instant::now();
-    let (mut words, mut filesystem, mut force) = (vec![], "/".to_string(), false);
+    let (mut words, mut filesystem, mut force, mut headless) = (vec![], "/".to_string(), false, false);
     let mut it = args.iter();
     let mut parsed = Ok(());
     while let Some(a) = it.next() {
@@ -80,6 +82,7 @@ fn run(args: &[String]) -> Result<i32, String> {
                 None => parsed = Err(USAGE.to_string()),
             },
             "--force" => force = true,
+            "--headless" => headless = true,
             _ if a.starts_with("--") => parsed = Err(format!("unknown argument {a}; {USAGE}")),
             _ => words.push(a.as_str()),
         }
@@ -90,11 +93,11 @@ fn run(args: &[String]) -> Result<i32, String> {
     let op = match words[..] {
         _ if parsed.is_err() => "cli.other".into(),
         [w @ ("check" | "rules" | "projection" | "update" | "rollback")] => format!("cli.{w}"),
-        ["selftest" | "profile"] | ["service", "run"] => String::new(),
+        ["selftest" | "profile" | "disconnect"] | ["enroll", _] | ["connection", "status"] | ["service", "run"] => String::new(),
         ["service", _] => "cli.service".into(),
         _ => "cli.other".into(),
     };
-    let result = parsed.and_then(|()| dispatch(&t, &words, &filesystem, force));
+    let result = parsed.and_then(|()| dispatch(&t, &words, &filesystem, force, headless));
     if op.is_empty() {
         profile::discard();
     } else {
@@ -109,7 +112,7 @@ fn run(args: &[String]) -> Result<i32, String> {
     result
 }
 
-fn dispatch(t: &coreq::Tool, words: &[&str], filesystem: &str, force: bool) -> Result<i32, String> {
+fn dispatch(t: &coreq::Tool, words: &[&str], filesystem: &str, force: bool, headless: bool) -> Result<i32, String> {
     match words {
         ["check"] => {
             let (code, report) = check(&t.install, filesystem, force)?;
@@ -121,10 +124,13 @@ fn dispatch(t: &coreq::Tool, words: &[&str], filesystem: &str, force: bool) -> R
             Ok(0)
         }
         ["projection"] => {
-            let _lock = lock(&t.install)?;
+            let _lock = lock(&t.install, "projection")?;
             println!("{}", pretty(&projection(&t.install)?));
             Ok(0)
         }
+        ["enroll", url] => enroll(&t.install, url, &mut coreq::enroll::Https { browser: !headless }),
+        ["connection", "status"] => connection_status(&t.install, &mut coreq::enroll::Https { browser: false }),
+        ["disconnect"] => disconnect(&t.install, &mut coreq::enroll::Https { browser: false }),
         ["update"] => {
             match coreq::update::update(t, false)? {
                 Some(v) => println!("serverq: updated to {v}"),
@@ -142,7 +148,7 @@ fn dispatch(t: &coreq::Tool, words: &[&str], filesystem: &str, force: bool) -> R
 
 /// One locked audit; exit 0 all `ok`, 1 a `warn`, 2 any `unknown`.
 fn check(home: &Path, filesystem: &str, force: bool) -> Result<(i32, Value), String> {
-    let _lock = lock(home)?;
+    let _lock = lock(home, "check")?;
     let report = audit(home, filesystem, force)?;
     let statuses: Vec<&str> = report["results"].as_object().into_iter().flatten().map(|(_, r)| r["status"].as_str().unwrap_or("unknown")).collect();
     Ok((if statuses.contains(&"unknown") { 2 } else if statuses.contains(&"warn") { 1 } else { 0 }, report))
@@ -243,13 +249,15 @@ fn end(t: &coreq::Tool) -> Result<(), String> {
     }
     coreq::service::run_all(&unit(t).stop, true)?;
     // ponytail: PowerShell CIM, the one stock tool that lists processes with their paths; no double quotes, which the
-    // Windows command line would mangle
+    // Windows command line would mangle. Stop-Process does not wait for the exit, so wait up to 5 s before calling a
+    // process a survivor.
     let script = format!(
         "$me = {pid}; $up = (Get-CimInstance Win32_Process -Filter ('ProcessId=' + $me)).ParentProcessId; \
          $mine = {{ Get-CimInstance Win32_Process -Filter 'Name=''serverq.exe''' | \
          Where-Object {{ $_.ProcessId -notin @($me, $up) -and ([string]$_.ExecutablePath).StartsWith('{dir}\\', 'OrdinalIgnoreCase') }} }}; \
          & $mine | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue; 'ended ' + $_.ProcessId + ' ' + $_.ExecutablePath }}; \
-         if (& $mine) {{ 'serverq processes of the install folder survived'; exit 1 }}",
+         foreach ($i in 1..20) {{ if (-not (& $mine)) {{ exit 0 }}; Start-Sleep -Milliseconds 250 }}; \
+         'serverq processes of the install folder survived'; exit 1",
         pid = std::process::id(),
         dir = t.install.display().to_string().replace('\'', "''")
     );
@@ -349,7 +357,7 @@ fn migrate(t: &coreq::Tool, legacy: &Path) -> Result<File, String> {
         .map_err(restore)?;
     println!("3. legacy units stopped; their files stay");
     let copy = || -> Result<(), String> {
-        let _install = lock(&t.install)?;
+        let _install = lock(&t.install, "check")?;
         for f in [&state, &report].into_iter().filter(|f| f.exists()) {
             let v: Value = serde_json::from_slice(&fs::read(f).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
             save_json(&t.install.join(f.file_name().unwrap_or_default()), &v)?;
@@ -381,19 +389,21 @@ fn serve(t: &coreq::Tool) -> Result<i32, String> {
     let (check_every, update_every) = (every("SERVERQ_CHECK_EVERY", 3600), every("SERVERQ_UPDATE_EVERY", 86400));
     let start = Instant::now();
     let (mut next_check, mut next_update) = (start + check_every.min(Duration::from_secs(300)), start + update_every.min(Duration::from_secs(900)));
-    let host = fs::read_to_string("/proc/sys/kernel/hostname")
-        .or_else(|_| fs::read_to_string("/etc/hostname"))
-        .or_else(|_| std::env::var("COMPUTERNAME"))
-        .map(|h| h.trim().to_string())
-        .unwrap_or_default();
+    let host = hostname();
+    let mut backoff = coreq::enroll::Backoff::default();
+    let mut next_send = None;
     let (mut check_status, mut update_at, mut check_error, mut update_error): (Value, Value, Option<String>, Option<String>) = (Value::Null, Value::Null, None, None);
     // the launcher runs `releases/<ver>/serverq`; a first completed check marks that release healthy
     let healthy = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("healthy"))).filter(|h| h.parent().and_then(Path::parent) == Some(&t.install.join("releases")));
     println!("serverq {VERSION}: service started");
     loop {
-        std::thread::sleep(next_check.min(next_update).saturating_duration_since(Instant::now()));
+        let next = next_check.min(next_update);
+        std::thread::sleep(next_send.filter(|s| *s < next).unwrap_or(next).saturating_duration_since(Instant::now()));
         let paused = t.install.join("paused").exists();
-        if Instant::now() >= next_check {
+        let mut checked = false;
+        // a delivery retry wakes the loop before the next check or update without running either
+        let retry = next_send.is_some_and(|s| s < next);
+        if !retry && Instant::now() >= next_check {
             next_check += check_every;
             let start = Instant::now();
             let result = check(&t.install, "/", false);
@@ -417,6 +427,7 @@ fn serve(t: &coreq::Tool) -> Result<i32, String> {
                         let _ = fs::write(h, "");
                     }
                     check_error = None;
+                    checked = true;
                 }
                 Err(e) => {
                     check_status = json!({"at": now() as u64, "exit": 2, "counts": {}, "report": Value::Null});
@@ -424,7 +435,7 @@ fn serve(t: &coreq::Tool) -> Result<i32, String> {
                     check_error = Some(format!("check: {e}"));
                 }
             }
-        } else {
+        } else if !retry {
             next_update += update_every;
             update_at = (now() as u64).into();
             if paused {
@@ -451,12 +462,198 @@ fn serve(t: &coreq::Tool) -> Result<i32, String> {
             }
         }
         profile::flush(&t.install);
+        // the connection never changes a check result or the schedule; its outcome is one journal line
+        next_send = connection_pass(&t.install, checked, &mut backoff, &mut coreq::enroll::Https { browser: false }).map(|s| Instant::now() + Duration::from_secs(s));
         let error = [&check_error, &update_error].into_iter().flatten().cloned().collect::<Vec<_>>();
         let mut s = coreq::status::common(t, &host, "serverq", now() as u64, (!error.is_empty()).then(|| error.join("; ")), None);
         s["check"] = check_status.clone();
         s["update_at"] = update_at.clone();
         s["paused"] = t.install.join("paused").exists().into();
         coreq::write_atomic(&t.install.join("status.json"), &pretty(&s))?;
+    }
+}
+
+fn hostname() -> String {
+    fs::read_to_string("/proc/sys/kernel/hostname")
+        .or_else(|_| fs::read_to_string("/etc/hostname"))
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .map(|h| h.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// `<install>/connection`, coreq's connection folder; coreq's identity is first seeded with `<install>/installation`,
+/// so the grant and the projection name one installation.
+fn connection(home: &Path) -> Result<PathBuf, String> {
+    let dir = home.join("connection");
+    if !dir.join("connection.json").exists() {
+        // ponytail: writes coreq's documented initial state (coreq docs/design/enrollment.md § Client); coreq protects it on first load
+        let id = installation(home)?;
+        save_json(&dir.join("connection.json"), &json!({"installation": id, "pending": null, "active": null, "revoke": []}))?;
+    }
+    Ok(dir)
+}
+
+/// Pairs, sends the current projection and reports `Connected` only for its `projected` receipt (docs/design/enrollment.md).
+fn enroll(home: &Path, url: &str, wire: &mut dyn coreq::enroll::Wire) -> Result<i32, String> {
+    let dir = connection(home)?;
+    let _lock = lock(&dir, "enroll")?;
+    let label: String = hostname().chars().filter(|c| c.is_ascii_alphanumeric() || "._-".contains(*c)).take(64).collect();
+    let req = coreq::enroll::Request { product: "serverq", host_label: if label.is_empty() { "host" } else { &label }, schemas: &[SCHEMA], installation: None, scope: None, capabilities: &[] };
+    let a = coreq::enroll::pair(&dir, url, &req, wire)?;
+    let unverified = |stage: String| format!("paired with {url}, not verified: {stage}; the service retries after its next check");
+    let r = queue(home, &dir).map_err(unverified)?;
+    let (mut backoff, deadline) = (coreq::enroll::Backoff::default(), wire.now() + 60);
+    let mut state = "unsent".to_string();
+    while wire.now() < deadline {
+        if dir.join("snapshot.json").exists() {
+            match send(&dir, &mut backoff, wire) {
+                Ok(None) => continue,
+                Ok(Some(s)) => wire.sleep(s.min(deadline.saturating_sub(wire.now())).max(1)),
+                Err(e) => return Err(unverified(e)),
+            }
+            continue;
+        }
+        match coreq::enroll::receipt(&dir, &r, wire) {
+            Ok("projected") => {
+                println!("Connected: {url} workspace {} generation {} snapshot {}", a["workspace"].as_str().unwrap_or("?"), a["generation"], r["event_id"].as_str().unwrap_or_default());
+                return Ok(0);
+            }
+            Ok(s) => state = s.into(),
+            Err(e) => state = e,
+        }
+        wire.sleep(2);
+    }
+    Err(unverified(format!("snapshot {} {state} after 60 s", r["event_id"].as_str().unwrap_or_default())))
+}
+
+/// Replaces the unsent record with the current projection (coalesced latest snapshot); never reruns a check.
+fn queue(home: &Path, dir: &Path) -> Result<Value, String> {
+    let p = projection(home)?;
+    let id = format!("r-{}", &sha256(p.to_string().as_bytes())[..32]);
+    let r = coreq::enroll::stamp(dir, SCHEMA, &id, p["observed_at"].as_f64().unwrap_or(0.0) as u64, p)?;
+    save_json(&dir.join("snapshot.json"), &r)?;
+    Ok(r)
+}
+
+/// One delivery try of `snapshot.json`: `accepted` moves it to `sent.json`, `rejected` ends it; `Ok(Some(secs))` retries.
+fn send(dir: &Path, backoff: &mut coreq::enroll::Backoff, wire: &mut dyn coreq::enroll::Wire) -> Result<Option<u64>, String> {
+    let p = dir.join("snapshot.json");
+    let r: Value = serde_json::from_slice(&fs::read(&p).map_err(|e| format!("{}: {e}", p.display()))?).map_err(|_| format!("invalid {}", p.display()))?;
+    match coreq::enroll::deliver(dir, std::slice::from_ref(&r), backoff, wire) {
+        Ok(got) if got[0]["state"] == "accepted" => fs::rename(&p, dir.join("sent.json")).map(|_| None).map_err(|e| format!("{}: {e}", p.display())),
+        Ok(got) => {
+            fs::remove_file(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+            Err(format!("snapshot {} rejected: {}", r["event_id"].as_str().unwrap_or_default(), got[0]["reason"].as_str().unwrap_or("unknown")))
+        }
+        Err(coreq::enroll::Delivery::Retry(s)) => Ok(Some(s)),
+        Err(coreq::enroll::Delivery::Stopped(e)) => Err(e),
+    }
+}
+
+/// The service's connection step: revoke retries, then, with an active grant, a fresh snapshot after a check and its
+/// delivery. Returns seconds to the next try. A never-enrolled install creates no connection state.
+fn connection_pass(home: &Path, checked: bool, backoff: &mut coreq::enroll::Backoff, wire: &mut dyn coreq::enroll::Wire) -> Option<u64> {
+    let dir = home.join("connection");
+    if !dir.join("connection.json").exists() {
+        return None;
+    }
+    let Ok(_lock) = lock(&dir, "delivery") else { return Some(60) };
+    let revoke = coreq::enroll::retry_revokes(&dir, wire).err();
+    if let Some(e) = &revoke {
+        println!("serverq: connection: {e}");
+    }
+    if !matches!(coreq::enroll::active(&dir), Ok(Some(_))) {
+        return revoke.map(|_| backoff.next(None));
+    }
+    if checked && let Err(e) = queue(home, &dir) {
+        println!("serverq: connection: snapshot not queued: {e}");
+    }
+    if !dir.join("snapshot.json").exists() {
+        return revoke.map(|_| backoff.next(None));
+    }
+    match send(&dir, backoff, wire) {
+        Ok(None) => {
+            println!("serverq: connection: snapshot accepted");
+            None
+        }
+        Ok(Some(s)) => {
+            println!("serverq: connection: snapshot retry in {s}s");
+            Some(s)
+        }
+        Err(e) => {
+            println!("serverq: connection: {e}");
+            None
+        }
+    }
+}
+
+/// Connection, destination and last snapshot; reads `connection.json` for pending pairing and revokes, never prints a credential.
+fn connection_status(home: &Path, wire: &mut dyn coreq::enroll::Wire) -> Result<i32, String> {
+    let dir = home.join("connection");
+    let p = dir.join("connection.json");
+    if !p.exists() {
+        println!("Connection: none");
+        return Ok(0);
+    }
+    let _lock = lock(&dir, "status")?;
+    let s: Value = serde_json::from_slice(&fs::read(&p).map_err(|e| format!("{}: {e}", p.display()))?).map_err(|_| format!("{}: unreadable connection state", p.display()))?;
+    let mut code = 2;
+    match coreq::enroll::active(&dir)? {
+        Some(a) => {
+            println!("Connection: active {} workspace {} generation {}", a["destination"].as_str().unwrap_or("?"), a["workspace"].as_str().unwrap_or("?"), a["generation"]);
+            // absent reads None; a present but unreadable record is an error, kept and never read past to an older receipt
+            let read = |f: &str| match fs::read(dir.join(f)) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(format!("{f}: {e}")),
+                Ok(b) => serde_json::from_slice::<Value>(&b).map(Some).map_err(|_| format!("{f}: unreadable")),
+            };
+            let last = match read("snapshot.json") {
+                Ok(None) => read("sent.json").map(|r| r.map(|r| (r, true))),
+                r => r.map(|r| r.map(|r| (r, false))),
+            };
+            match last {
+                Ok(Some((r, false))) => println!("Snapshot: {} unsent", r["event_id"].as_str().unwrap_or_default()),
+                Ok(Some((r, true))) => {
+                    let state = coreq::enroll::receipt(&dir, &r, wire).map(String::from).unwrap_or_else(|e| format!("unknown ({e})"));
+                    code = if state == "projected" { 0 } else { 2 };
+                    println!("Snapshot: {} {state}", r["event_id"].as_str().unwrap_or_default());
+                }
+                Ok(None) => println!("Snapshot: none yet"),
+                Err(e) => println!("Snapshot: unknown ({e})"),
+            }
+        }
+        None if s["pending"].is_object() => println!("Connection: pending approval at {}", s["pending"]["destination"].as_str().unwrap_or("?")),
+        None => println!("Connection: disconnected"),
+    }
+    let revokes = s["revoke"].as_array().map_or(0, Vec::len);
+    if revokes > 0 {
+        println!("Revocation: {revokes} pending");
+    }
+    Ok(code)
+}
+
+/// Stops sending at once; `Disconnected locally; revocation pending` while DashQ is unreachable (DashQ C1).
+fn disconnect(home: &Path, wire: &mut dyn coreq::enroll::Wire) -> Result<i32, String> {
+    let dir = home.join("connection");
+    if !dir.join("connection.json").exists() {
+        println!("Not connected");
+        return Ok(0);
+    }
+    let _lock = lock(&dir, "disconnect")?;
+    let r = coreq::enroll::disconnect(&dir, wire);
+    for f in ["snapshot.json", "sent.json"] {
+        let _ = fs::remove_file(dir.join(f));
+    }
+    match r {
+        Ok(()) => {
+            println!("Disconnected");
+            Ok(0)
+        }
+        Err(e) if e.ends_with("revoke pending") => {
+            println!("Disconnected locally; revocation pending");
+            Ok(1)
+        }
+        Err(e) => Err(e),
     }
 }
 
@@ -483,7 +680,7 @@ fn service_status(t: &coreq::Tool) -> Result<i32, String> {
 }
 
 /// Exclusive `<home>/lock`; a busy lock is an error, never a skipped audit.
-fn lock(home: &Path) -> Result<File, String> {
+fn lock(home: &Path, what: &str) -> Result<File, String> {
     let e = |e: std::io::Error| format!("{}: {e}", home.display());
     fs::DirBuilder::new().recursive(true).mode(0o700).create(home).map_err(e)?;
     private(home, 0o700).map_err(e)?;
@@ -491,8 +688,17 @@ fn lock(home: &Path) -> Result<File, String> {
     // write, not append: Windows locks only a handle with write access
     let f = OpenOptions::new().write(true).create(true).truncate(false).mode(0o600).open(&p).map_err(e)?;
     private(&p, 0o600).map_err(e)?;
-    f.try_lock().map_err(|err| match err {
-        fs::TryLockError::WouldBlock => "serverq is already running; check was not started".to_string(),
+    // a child spawned by another thread holds a copy of a just-closed lock until its exec; wait that out, not a running serverq
+    let mut r = f.try_lock();
+    for _ in 0..5 {
+        if !matches!(r, Err(fs::TryLockError::WouldBlock)) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        r = f.try_lock();
+    }
+    r.map_err(|err| match err {
+        fs::TryLockError::WouldBlock => format!("serverq is already running; {what} was not started"),
         fs::TryLockError::Error(err) => format!("{}: {err}", p.display()),
     })?;
     Ok(f)
@@ -1139,6 +1345,156 @@ mod tests {
         assert_ne!(projection(&home).unwrap()["installation"], id.as_str(), "a lost identity is a new installation");
         fs::write(home.join("installation"), "host-name").unwrap();
         assert!(projection(&home).is_err(), "a corrupt identity is kept, never replaced");
+    }
+
+    /// Fake DashQ for coreq-enrollment/1: approves on the first token poll into `workspace`, projects every accepted record.
+    #[derive(Default)]
+    struct Dash {
+        online: bool,
+        workspace: String,
+        installation: Value,
+        now: u64,
+        /// credential, generation, workspace, revoked
+        grants: Vec<(String, u64, String, bool)>,
+        /// workspace, generation, record
+        events: Vec<(String, u64, Value)>,
+    }
+
+    impl coreq::enroll::Wire for Dash {
+        fn post(&mut self, _: &str, route: &str, auth: Option<&str>, body: &Value) -> Result<(u16, Value), String> {
+            if !self.online {
+                return Err("no reply".into());
+            }
+            let reply = |status: u16, mut v: Value| {
+                v["protocol"] = json!(1);
+                Ok((status, v))
+            };
+            let g = auth.and_then(|a| self.grants.iter().position(|g| g.0 == a));
+            if auth.is_some() && route != "/connection/revoke" && !g.is_some_and(|i| !self.grants[i].3) {
+                return reply(401, json!({"error": "revoked"}));
+            }
+            match route {
+                "/connect/device" => {
+                    self.installation = body["installation"].clone();
+                    reply(200, json!({"device_code": "d", "user_code": "ABCD-1234", "verification_uri": "https://dash.example/connect", "expires_in": 600, "interval": 5}))
+                }
+                "/connect/token" => {
+                    let generation = self.grants.len() as u64 + 1;
+                    self.grants.push((format!("cred-{generation}"), generation, self.workspace.clone(), false));
+                    reply(200, json!({"credential": format!("cred-{generation}"), "installation": self.installation, "generation": generation, "product": "serverq",
+                        "workspace": self.workspace, "schemas": [SCHEMA]}))
+                }
+                "/connect/ack" => {
+                    let generation = self.grants[g.unwrap()].1;
+                    self.grants.iter_mut().filter(|o| o.1 < generation).for_each(|o| o.3 = true);
+                    reply(200, json!({"state": "active", "generation": generation}))
+                }
+                "/ingest" => {
+                    let (_, generation, ws, _) = self.grants[g.unwrap()].clone();
+                    let receipts: Vec<Value> = body["records"].as_array().unwrap().iter().map(|r| {
+                        assert!(r.get("grant").is_none(), "the local grant binding never leaves");
+                        // a replay of the same event returns its stored receipt
+                        if !self.events.iter().any(|e| e.0 == ws && e.1 == generation && e.2["event_id"] == r["event_id"]) {
+                            self.events.push((ws.clone(), generation, r.clone()));
+                        }
+                        json!({"event_id": r["event_id"], "state": "accepted"})
+                    }).collect();
+                    reply(200, json!({"receipts": receipts}))
+                }
+                "/connection/receipt" => {
+                    let (_, generation, ws, _) = self.grants[g.unwrap()].clone();
+                    match self.events.iter().find(|e| e.0 == ws && e.1 == generation && e.2["event_id"] == body["event_id"]) {
+                        Some(e) => reply(200, json!({"installation": self.installation, "generation": generation, "schema": e.2["schema"], "event_id": e.2["event_id"], "state": "projected"})),
+                        None => reply(404, json!({"error": "unknown_event"})),
+                    }
+                }
+                "/connection/revoke" => {
+                    let i = g.unwrap();
+                    self.grants[i].3 = true;
+                    reply(200, json!({"state": "revoked", "generation": self.grants[i].1}))
+                }
+                r => panic!("unexpected route {r}"),
+            }
+        }
+        fn now(&self) -> u64 {
+            self.now
+        }
+        fn sleep(&mut self, secs: u64) {
+            self.now += secs;
+        }
+        fn show(&mut self, _: &str, _: &str) {}
+    }
+
+    fn report_at(home: &Path, at: u64) {
+        fs::write(home.join("report.json"), json!({"schema": 1, "at": at, "revision": "r", "results": {"disk-headroom": {"status": "warn", "detail": "/srv", "available": 5, "total": 100, "reason": "below-minimum"}},
+            "incidents": {}, "manual_rules": []}).to_string()).unwrap();
+    }
+
+    /// docs/design/enrollment.md qualification against a fake DashQ: enroll, coalesced delivery, offline disconnect,
+    /// reconnect into another workspace, dashboard revoke; the report and its checks are never touched.
+    #[test]
+    fn connection_lifecycle() {
+        let home = scratch("connection");
+        let mut dash = Dash { online: true, workspace: "ws-1".into(), now: 1000, ..Default::default() };
+        let mut backoff = coreq::enroll::Backoff::default();
+        assert_eq!(connection_pass(&home, true, &mut backoff, &mut dash), None);
+        assert!(!home.join("connection").exists(), "a never-enrolled install keeps no connection state");
+        assert!(enroll(&home, "http://dash.example", &mut dash).is_err(), "https only");
+        report_at(&home, 100);
+        let report = fs::read(home.join("report.json")).unwrap();
+        assert_eq!(enroll(&home, "https://dash.example", &mut dash), Ok(0));
+        let (ws, generation, r) = dash.events[0].clone();
+        assert_eq!((ws.as_str(), generation, r["schema"].as_str(), &r["observed_at"]), ("ws-1", 1, Some(SCHEMA), &json!(100)), "an old report stays old");
+        assert_eq!(r["payload"], projection(&home).unwrap(), "only the allowlisted projection leaves");
+        assert_eq!(dash.installation, r["payload"]["installation"], "grant and projection name one installation");
+        assert!(!r.to_string().contains("/srv"));
+        assert_eq!(fs::read(home.join("report.json")).unwrap(), report, "enroll never reruns a check");
+        assert_eq!(enroll(&home, "https://dash.example", &mut dash), Ok(0), "repeated enroll verifies the same grant");
+        assert_eq!((dash.grants.len(), dash.events.len()), (1, 1), "same report: same event, no duplicate");
+        assert_eq!(connection_status(&home, &mut dash), Ok(0));
+
+        // outage: only the latest unsent snapshot survives
+        dash.online = false;
+        report_at(&home, 200);
+        assert!(connection_pass(&home, true, &mut backoff, &mut dash).is_some(), "a transient failure retries");
+        report_at(&home, 300);
+        assert!(connection_pass(&home, true, &mut backoff, &mut dash).is_some());
+        assert_eq!(connection_status(&home, &mut dash), Ok(2), "unsent is not connected");
+        dash.online = true;
+        // a corrupt unsent record over an older projected receipt reads unknown and stays for investigation
+        let unsent = home.join("connection/snapshot.json");
+        let (kept, older) = (fs::read(&unsent).unwrap(), home.join("connection/sent.json"));
+        assert!(older.exists(), "an older projected receipt is present");
+        fs::write(&unsent, b"{corrupt").unwrap();
+        assert_eq!(connection_status(&home, &mut dash), Ok(2), "corrupt is unknown, not the older projected receipt");
+        assert_eq!(fs::read(&unsent).unwrap(), b"{corrupt", "the corrupt record is kept");
+        fs::write(&unsent, kept).unwrap();
+        assert_eq!(connection_pass(&home, false, &mut backoff, &mut dash), None);
+        assert_eq!(dash.events.iter().map(|e| e.2["observed_at"].as_u64().unwrap()).collect::<Vec<_>>(), [100, 300], "coalesced");
+
+        // offline disconnect stops sending at once; the revoke retries when DashQ is back
+        let old: Value = serde_json::from_slice(&fs::read(home.join("connection/sent.json")).unwrap()).unwrap();
+        dash.online = false;
+        assert_eq!(disconnect(&home, &mut dash), Ok(1));
+        report_at(&home, 400);
+        dash.online = true;
+        assert!(connection_pass(&home, true, &mut backoff, &mut dash).is_none(), "revoke delivered");
+        assert_eq!((dash.events.len(), dash.grants[0].3), (2, true), "nothing sent after disconnect; grant revoked");
+        assert_eq!(connection_status(&home, &mut dash), Ok(2));
+
+        // reconnect into another workspace: new generation, old data never reaches it
+        dash.workspace = "ws-2".into();
+        assert_eq!(enroll(&home, "https://dash.example", &mut dash), Ok(0));
+        save_json(&home.join("connection/snapshot.json"), &old).unwrap();
+        assert_eq!(send(&home.join("connection"), &mut backoff, &mut dash), Err(format!("snapshot {} rejected: grant", old["event_id"].as_str().unwrap())));
+        assert!(dash.events.iter().filter(|e| e.0 == "ws-2").all(|e| e.1 == 2 && e.2["observed_at"] == 400), "{:?}", dash.events);
+
+        // a dashboard revoke ends sending until a new approval
+        dash.grants[1].3 = true;
+        report_at(&home, 500);
+        assert_eq!(connection_pass(&home, true, &mut backoff, &mut dash), None);
+        assert_eq!(coreq::enroll::active(&home.join("connection")), Ok(None));
+        assert_eq!(dash.events.len(), 3);
     }
 
     #[test]

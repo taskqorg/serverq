@@ -6,7 +6,7 @@ serverq checks a Linux server against the agreed server-care rules and reports d
 
 [specq verification](https://github.com/taskqorg/specq/blob/main/engineering/verification.md) binds serverq: unknown is never healthy (here the status `unknown`), and remediation is scoped and separate.
 
-- **Connection target.** [Independent enrollment](docs/design/enrollment.md) adds explicitly approved observation delivery through coreq; primary checks and recommendations remain read-only. No AgentQ/Langfuse dependency.
+- **Connection.** [Independent enrollment](docs/design/enrollment.md) adds explicitly approved observation delivery through coreq (§ 5); primary checks and recommendations remain read-only. No AgentQ/Langfuse dependency, no command channel: DashQ can neither rerun nor repair a check.
 - **Read-only.** serverq writes only its own install folder. It never changes server settings, deletes operator data, resets failures, restarts other services, runs AI or applies recommendations. Remediation is a separate action by an agent or operator.
 - **One catalog.** `rules.json` at the repository root is the only recommendation catalog. The binary embeds its exact bytes at build time; no other file, doc or agent copies its thresholds.
 - **Dynamic checks every time.** Capacity and service checks run on every pass. Only configuration checks are cached (§ 3).
@@ -22,6 +22,9 @@ serverq checks a Linux server against the agreed server-care rules and reports d
 | `serverq rules` | Prints the embedded `rules.json` bytes unchanged | 0 |
 | `serverq projection` | Prints the allowlisted projection of `report.json` (§ 3); never runs a check | 0; 2 no or invalid report, invalid identity |
 | `serverq profile` | Prints the profile report (§ 9); never runs a check | 0; 2 unreadable profile |
+| `serverq enroll <https-url> [--headless]` | coreq pairing: one browser approval (`--headless` only prints the link and code), then sends the current projection and polls its receipt every 2 s for at most 60 s; never runs a check | 0 `Connected` (receipt `projected`); 2 not verified (the connection stays, the service retries) or error |
+| `serverq connection status` | Prints `Connection: none\|pending\|active\|disconnected`, destination, workspace and generation, `Snapshot: <event> unsent\|accepted\|projected`, or `Snapshot: unknown (<reason>)` when `snapshot.json` or `sent.json` is present but unreadable (kept for investigation, never read past to an older receipt), and pending revokes; never a credential | 0 none, or active with its last snapshot `projected`; 2 otherwise |
+| `serverq disconnect` | Stops sending at once and revokes through coreq | 0 revoked or never connected; 1 `Disconnected locally; revocation pending`; 2 error |
 | `serverq update` | coreq update (§ 4) | coreq |
 | `serverq rollback` | coreq rollback: `previous` into `current`, then `service pause` (§ 4) | coreq |
 | `serverq selftest` | coreq harness: the embedded `rules.json` parses and one `check` in a temporary install, deleted afterwards, completes with a report naming every automated rule, whatever their status | 0 pass; 2 fails |
@@ -82,6 +85,7 @@ One OS unit replaces `serverq-check.service`, `serverq-check.timer`, `serverq-up
 - `service run` loop: a check 5 min after start, then every `check_every` (3600 s); the coreq update check 15 min after start, then every `update_every` (86400 s). Env `SERVERQ_CHECK_EVERY` and `SERVERQ_UPDATE_EVERY` (seconds) override the periods for tests; each first pass waits at most its period. One loop: a check and an update never overlap. A check result 1 is a normal pass, not a service failure. An installed update exits 75 and systemd starts the new `current`. Each pass prints one line to the journal.
 - `pause` writes `<install>/paused` and stops updates only; checks continue, since stopping them would hide deviations. `resume` removes it. `restart`, `stop` and `uninstall` run `systemctl --user restart`, `stop` and `disable --now`; `uninstall` also deletes the unit file, never the install folder.
 - `<install>/status.json` (coreq common keys, `project` `serverq`) adds `check`: `at`, `exit`, counts per status, `report` path, and `update_at`, `paused`. `error` holds the last check or update failure. Missing, unreadable, or a check older than 2 × `check_every`, reads unknown with a reason. `service status` prints `Check: ok|warn|unknown <age>` and `Update: <version|up to date|paused|unknown>`.
+- Connection: `<install>/connection/` holds coreq's `connection.json` (first seeded with `<install>/installation`, so the grant and the projection name one installation), `lock`, `snapshot.json`, the latest unsent record (schema `serverq-report/1`, event ID `r-` plus 32 hex of the payload's sha256, observed at the report's `at`), and `sent.json`, the last accepted one. With an active connection, each completed check replaces `snapshot.json` (coalesced: an older unsent one is dropped) and delivers it; `rejected` ends it; a transient failure retries after coreq's backoff without moving the check or update schedule. Every pass retries queued revokes. Delivery never changes a check result, its exit or its schedule; its outcome is one journal line. No heartbeat between checks: DashQ shows the report stale by its own observation time.
 - Monitors read `report.json` or `status.json`; serverq adds no second scheduler, cleaner or notifier.
 
 ## 6. Migration of the legacy layout
@@ -113,7 +117,7 @@ A Windows host runs the service and reports the Linux-only rules as unknown; Win
 
 ## 8. Checks
 
-`cargo test --locked`, then `serverq selftest`, then `serverq check --home <temp>` on the authorized host. Tests cover each rule's `ok`/`warn`/`unknown`, cache hit, TTL and revision invalidation, corrupt state, exit codes, the migration steps against a fake legacy folder, and update then rollback against a fake release served by a fake `curl`. Linux-only service tests compile only on Linux; on other OSes the CLI test asserts `unsupported-os`. CI runs the tests on Linux and Windows; the Scheduled Task is verified on the authorized Windows host.
+`cargo test --locked`, then `serverq selftest`, then `serverq check --home <temp>` on the authorized host. Tests cover enroll, coalesced delivery, receipts, crash recovery, cross-workspace reconnect and offline disconnect against a fake DashQ, each rule's `ok`/`warn`/`unknown`, cache hit, TTL and revision invalidation, corrupt state, exit codes, the migration steps against a fake legacy folder, and update then rollback of an enrolled install against a fake release served by a fake `curl`. Linux-only service tests compile only on Linux; on other OSes the CLI test asserts `unsupported-os`. CI runs the tests on Linux and Windows; the Scheduled Task is verified on the authorized Windows host.
 
 ## 9. Profiling
 
@@ -131,7 +135,7 @@ serverq follows [specq built-in profiling](https://github.com/taskqorg/specq/blo
 | | `probe.systemctl`, `probe.systemd-analyze` | 2 s | 1% |
 | | `probe.docker` (each docker CLI call) | 5 s | 1% |
 
-- Counters are always on. Each process keeps its samples in memory and merges them into `<install>/profile.json` when its command or service pass ends, only when `<install>` already exists; `selftest` records nothing. Concurrent writers may lose a sample, never corrupt the file.
+- Counters are always on. Each process keeps its samples in memory and merges them into `<install>/profile.json` when its command or service pass ends, only when `<install>` already exists; `selftest`, `profile` and the connection commands (`enroll`, `connection status`, `disconnect`: they wait on the network and the owner's approval) record nothing. Concurrent writers may lose a sample, never corrupt the file.
 - `profile.json` schema 1, per operation: `count`, `failed`, `errors` (class to count), `first`, `last` (Unix seconds) and `ms`, the last 200 durations. Each merge rebuilds the file from valid records of the operation names above with only these fields, so the file stays bounded and foreign content is dropped. A record is malformed when an error class is not listed below, error counts do not sum to `failed`, `failed` exceeds `count`, it holds more durations than `count` or 200, or a duration or time is negative, non-finite or `first` is after `last`. An unreadable file or malformed record is replaced by the next merge.
 - An outcome is `ok` or `failed` with an error class: `timeout`, `exit-nonzero`, `not-found`, `lock-busy`, `invalid-state`, `unknown-result` (a `check` that completed with an `unknown` rule) or `error`. serverq never retries, so no operation counts as retried. No message text, path, unit name or container ID is stored.
 - Detailed traces: while the file `<install>/trace` exists, each merge also appends one line per call to `<install>/trace.jsonl` (`op`, `at`, `ms`, `error`), pruned to the last 1000 lines. Off by default; delete `trace` to stop.
