@@ -117,7 +117,7 @@ A Windows host runs the service and reports the Linux-only rules as unknown; Win
 
 ## 8. Checks
 
-`cargo test --locked`, then `serverq selftest`, then `serverq check --home <temp>` on the authorized host. Tests cover enroll, coalesced delivery, receipts, cross-workspace reconnect and offline disconnect against a fake DashQ, each rule's `ok`/`warn`/`unknown`, cache hit, TTL and revision invalidation, corrupt state, exit codes, the migration steps against a fake legacy folder, and update then rollback against a fake release served by a fake `curl`. Linux-only service tests compile only on Linux; on other OSes the CLI test asserts `unsupported-os`. CI runs the tests on Linux and Windows; the Scheduled Task is verified on the authorized Windows host.
+`cargo test --locked`, then `serverq selftest`, then `serverq check --home <temp>` on the authorized host. Tests cover enroll, coalesced delivery, receipts, crash recovery, cross-workspace reconnect and offline disconnect against a fake DashQ, each rule's `ok`/`warn`/`unknown`, cache hit, TTL and revision invalidation, corrupt state, exit codes, the migration steps against a fake legacy folder, and update then rollback of an enrolled install against a fake release served by a fake `curl`. Linux-only service tests compile only on Linux; on other OSes the CLI test asserts `unsupported-os`. CI runs the tests on Linux and Windows; the Scheduled Task is verified on the authorized Windows host.
 
 ## 9. Profiling
 

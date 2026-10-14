@@ -16,21 +16,26 @@ A fresh connection may expose an old report as stale; it cannot rerun or repair 
 
 Prove an independently installed product can enroll, show a real matching snapshot in DashQ, recover after network/store restart, disconnect offline, revoke and reconnect without identity or scope leakage. Test denied/wrong-workspace requests, lost replies, bounded storage, schema compatibility and primary-function independence. Reuse coreq conformance; do not reimplement its auth or transport. Ship only after applicable E1–E10 and the product's normal checks pass.
 
-### Evidence (coreq v0.11.0, 2026-10-15)
+### Evidence (coreq v0.11.0, DashQ v0.9.0)
 
-Live, macOS (aarch64) against `https://dash.ufobe.com/machine`, workspace `gradus`, no AgentQ or Langfuse on the host: `serverq enroll --headless` printed one pairing code; after one owner approval it printed `Connected ... generation 1 snapshot r-d1a3850f...` (receipt `projected`); `connection status` exit 0 with that snapshot `projected`; `disconnect` printed `Disconnected` (revoked, exit 0); `connection status` then `disconnected`, exit 2. Live reconnect needs a second approval and is covered by the fake DashQ below.
+Live against `https://dash.ufobe.com/machine`, workspace `gradus`, no AgentQ or Langfuse on the hosts. Each run printed one pairing code; after one owner approval `enroll --headless` printed `Connected ... generation 1 snapshot r-...` (receipt `projected`) and `connection status` exited 0 with that snapshot `projected`.
+
+- macOS aarch64, 2026-10-15, 3a66168: then `disconnect` printed `Disconnected` (revoked, exit 0) and `connection status` read `disconnected`, exit 2.
+- WSL Ubuntu 24.04 x86_64 and native Windows 11 x86_64, same host label `DESKTOP`, 2026-10-15, binaries built from 145c23e (`src/` as 3a66168): two installations, `14baeb23...` and `79f3ceb9...`, each its own grant. Projection: WSL 3 `ok`, 1 `warn`, 1 `unknown`; Windows 5 `unknown` (`unsupported-os`); 4 manual rules each.
+- Service recovery, same two installs, live delivery: WSL as a systemd user unit with `Restart=always` (`systemd-run`), `kill -9` of its main process, systemd restarted it (`NRestarts` 1) and the next check's snapshot was `accepted` then `projected`; Windows under the coreq launcher, the `service run` child killed, the launcher restarted it after 60 s and delivery resumed. Both kept grant generation 1: no new pairing.
+- E1 page match is open: DashQ v0.9.0 `/data` shows hosts `no serverq report for this host` and versions `unsupported snapshot schema serverq-report/1`, although its receipt reads `projected`. DashQ renders only `agentq-snapshot/1`; [dashq#122](https://github.com/taskqorg/dashq/issues/122) owns the fix. Both clients keep reporting hourly (updates paused) for the rerun.
 
 | Case | Applies | Evidence |
 |---|---|---|
-| E1 | ServerQ in place of AgentQ | live run above; `connection_lifecycle` (allowlisted projection only, enroll never reruns a check, old report keeps its observation time) |
+| E1 | ServerQ in place of AgentQ | live CLI receipts above; `/data` and page pending dashq#122; `connection_lifecycle` (allowlisted projection only, enroll never reruns a check, old report keeps its observation time) |
 | E2 | yes | coreq conformance (deny, expire); repeated enroll verifies the same grant, no duplicate (`connection_lifecycle`) |
-| E3 | yes | coreq crash-safe `connection.json`; `connection_lifecycle` outage retry |
+| E3 | yes | `enrollment_recovers_from_crashes` (real binary, coreq HTTPS wire, fake DashQ): a crash before approval resumes the same pairing; a crash between send and receipt repeats the same event ID, stored once; a killed service delivers the unsent snapshot after restart; one pairing, one grant. Live systemd and launcher restarts above |
 | E4 | yes | `connection_lifecycle`: outage keeps only the latest unsent snapshot, checks and schedule untouched; `unsent` is not connected |
-| E5 | yes | live revoke; `connection_lifecycle`: old-grant snapshot rejected after reconnect to another workspace, dashboard revoke ends sending |
+| E5 | yes | live revoke (macOS); `connection_lifecycle`: old-grant snapshot rejected after reconnect to another workspace, dashboard revoke ends sending; connection folder 0700, files 0600 (`enrollment_recovers_from_crashes`, Linux), user-only ACL (coreq, Windows) |
 | E6 | yes | `projection_exports_only_the_allowlist`, `every_non_ok_result_has_a_known_reason`; schema-1 report unchanged |
-| E7 | yes | `connection_lifecycle`: offline disconnect exit 1, revoke retried, nothing sent after; `connection_commands_without_enrollment` |
-| E8 | yes | live run on a host without AgentQ/Langfuse; no command channel or write permission |
-| E9 | client side | `service_install_migrates_runs_updates_and_rolls_back`; coreq update prunes only `releases/` |
+| E7 | yes | `connection_lifecycle`: offline disconnect exit 1, revoke retried, nothing sent after; `connection_commands_without_enrollment`; live same-label hosts kept as two installations |
+| E8 | yes | live runs on hosts without AgentQ/Langfuse; no command channel or write permission |
+| E9 | client side | `service_install_migrates_runs_updates_and_rolls_back`: an enrolled install keeps `connection/` and `installation` byte for byte and `connection status` exit 0 through an update and a rollback, no second grant; coreq update prunes only `releases/` |
 | E10 | no | DashQ UI, qualified in dashq |
 
-Platforms: tests run in CI on Linux and Windows; the live run was macOS. Live runs on the authorized Linux and Windows hosts are not yet recorded.
+Platforms: `cargo test --locked` passes on Linux (WSL Ubuntu 24.04, all service and crash tests) and native Windows; CI runs both. A non-WSL Linux server and the Windows Scheduled Task itself (default install folder) are not live-qualified here.
