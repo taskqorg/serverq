@@ -676,7 +676,16 @@ fn lock(home: &Path, what: &str) -> Result<File, String> {
     // write, not append: Windows locks only a handle with write access
     let f = OpenOptions::new().write(true).create(true).truncate(false).mode(0o600).open(&p).map_err(e)?;
     private(&p, 0o600).map_err(e)?;
-    f.try_lock().map_err(|err| match err {
+    // a child spawned by another thread holds a copy of a just-closed lock until its exec; wait that out, not a running serverq
+    let mut r = f.try_lock();
+    for _ in 0..5 {
+        if !matches!(r, Err(fs::TryLockError::WouldBlock)) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        r = f.try_lock();
+    }
+    r.map_err(|err| match err {
         fs::TryLockError::WouldBlock => format!("serverq is already running; {what} was not started"),
         fs::TryLockError::Error(err) => format!("{}: {err}", p.display()),
     })?;
