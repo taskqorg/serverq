@@ -89,13 +89,16 @@ pub fn flush(home: &Path) {
             ops.len() - 1
         });
         let r = &mut ops[i].1;
-        r.count += 1;
-        r.last = r.last.max(s.at);
-        if let Some(c) = s.error {
-            r.failed += 1;
-            let n = r.errors.get(c).and_then(Value::as_u64).unwrap_or(0) + 1;
-            r.errors.insert(c.into(), n.into());
+        // a saturated counter stays put; failed and error counts stay below it, so the record stays consistent
+        if r.count < u64::MAX {
+            r.count += 1;
+            if let Some(c) = s.error {
+                r.failed += 1;
+                let n = r.errors.get(c).and_then(Value::as_u64).unwrap_or(0) + 1;
+                r.errors.insert(c.into(), n.into());
+            }
         }
+        r.last = r.last.max(s.at);
         r.ms.push((s.ms.max(0.0) * 1000.0).round() / 1000.0);
         let extra = r.ms.len().saturating_sub(SAMPLES);
         r.ms.drain(..extra);
@@ -105,8 +108,17 @@ pub fn flush(home: &Path) {
     if home.join("trace").exists() {
         let p = home.join("trace.jsonl");
         let old = fs::read_to_string(&p).unwrap_or_default();
-        let new = spans.iter().map(|s| json!({"op": s.op, "at": s.at, "ms": s.ms, "error": s.error}).to_string());
-        let lines: Vec<String> = old.lines().map(String::from).chain(new).collect();
+        // old rows are rebuilt from known fields; a row with an unknown operation, error class or bad number is dropped
+        let old = old.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).filter_map(|v| {
+            let op = BUDGETS.iter().find(|b| v["op"] == b.0)?.0;
+            let error = match &v["error"] {
+                Value::Null => None,
+                e => Some(*ERRORS.iter().find(|c| e == **c)?),
+            };
+            let (at, ms) = (v["at"].as_f64().filter(|x| x.is_finite() && *x >= 0.0)?, v["ms"].as_f64().filter(|x| x.is_finite() && *x >= 0.0)?);
+            Some(Span { op: op.into(), at, ms, error })
+        });
+        let lines: Vec<String> = old.chain(spans).map(|s| json!({"op": s.op, "at": s.at, "ms": s.ms, "error": s.error}).to_string()).collect();
         let keep = lines[lines.len().saturating_sub(TRACE_LINES)..].join("\n") + "\n";
         let _ = coreq::write_atomic(&p, &keep);
     }
@@ -278,6 +290,21 @@ mod tests {
             assert!(!kept.contains("/home/u/x") && !kept.contains("secret") && !kept.contains("probe.docker"), "{kept}");
             assert_eq!(row(&report(&home).unwrap(), "cli.rules")["count"], 2);
         }
+
+        // a saturated counter neither panics nor wraps; foreign trace rows and fields are dropped on merge
+        let mut max = good.clone();
+        (max["count"], max["failed"], max["errors"]) = (u64::MAX.into(), u64::MAX.into(), json!({"timeout": u64::MAX}));
+        fs::write(home.join("profile.json"), json!({"schema": 1, "ops": {"cli.rules": max}}).to_string()).unwrap();
+        record("cli.rules", t, Some("timeout"));
+        flush(&home);
+        assert_eq!(row(&report(&home).unwrap(), "cli.rules")["count"], u64::MAX);
+        let foreign = [r#"{"op":"cli.rules","at":1,"ms":1,"error":null,"note":"/home/u/x"}"#, r#"{"op":"/home/u/x","at":1,"ms":1,"error":null}"#, r#"{"op":"cli.rules","at":1,"ms":1,"error":"secret"}"#, r#"{"op":"cli.rules","at":-1,"ms":1,"error":null}"#, "/home/u/x"];
+        fs::write(home.join("trace.jsonl"), foreign.join("\n")).unwrap();
+        record("probe.statvfs", t, None);
+        flush(&home);
+        let trace = fs::read_to_string(home.join("trace.jsonl")).unwrap();
+        assert_eq!(trace.lines().count(), 2, "{trace}");
+        assert!(!trace.contains("/home/u/x") && !trace.contains("secret"), "{trace}");
 
         fs::write(home.join("profile.json"), "broken").unwrap();
         assert!(report(&home).unwrap_err().contains("invalid profile"));
