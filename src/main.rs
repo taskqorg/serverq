@@ -190,6 +190,12 @@ fn rollback(t: &coreq::Tool) -> Result<i32, String> {
 }
 
 fn service(t: &coreq::Tool, cmd: &str) -> Result<i32, String> {
+    if cfg!(target_os = "macos") && matches!(cmd, "install" | "restart" | "stop" | "uninstall") {
+        let default = PathBuf::from(std::env::var_os("HOME").ok_or("HOME is not set")?).join(".local/share/serverq");
+        if t.install != default {
+            return Err("the LaunchAgent uses the default install folder; drop --home and SERVERQ_INSTALL".into());
+        }
+    }
     let paused = t.install.join("paused");
     match cmd {
         "pause" => fs::write(&paused, "").map_err(|e| e.to_string())?,
@@ -199,7 +205,8 @@ fn service(t: &coreq::Tool, cmd: &str) -> Result<i32, String> {
         },
         "status" => return service_status(t),
         "run" => return serve(t),
-        _ if !LINUX && !cfg!(windows) => return Err("the service is Linux and Windows only (serverq.md § 7)".into()),
+        _ if !LINUX && !cfg!(windows) && !cfg!(target_os = "macos") => return Err("the service requires Linux, Windows or macOS (serverq.md § 5, § 7, § 10)".into()),
+        "install" if cfg!(target_os = "macos") => return install_mac(t),
         "install" if cfg!(windows) => return install_task(t),
         "install" => return install(t),
         "restart" => restart(t)?,
@@ -209,7 +216,11 @@ fn service(t: &coreq::Tool, cmd: &str) -> Result<i32, String> {
             if cfg!(windows) {
                 end(t)?;
             }
-            coreq::service::run_all(&u.unload, true)?;
+            if cfg!(target_os = "macos") {
+                end(t)?;
+            } else {
+                coreq::service::run_all(&u.unload, true)?;
+            }
             // a task this user may not delete (registered elevated) must not read as uninstalled
             if cfg!(windows) && coreq::quiet(Command::new("schtasks").args(["/Query", "/TN", TASK]).stdout(Stdio::null()).stderr(Stdio::null())).status().is_ok_and(|s| s.success()) {
                 return Err(format!("Scheduled Task {TASK} is still registered; delete it from the account that registered it"));
@@ -234,6 +245,10 @@ fn systemctl(args: &[&str]) -> Result<(), String> {
 }
 
 fn restart(t: &coreq::Tool) -> Result<(), String> {
+    if cfg!(target_os = "macos") {
+        end(t)?;
+        return coreq::service::run_all(&unit(t).load, false);
+    }
     if !cfg!(windows) {
         return systemctl(&["restart", UNIT]);
     }
@@ -244,6 +259,14 @@ fn restart(t: &coreq::Tool) -> Result<(), String> {
 /// Stops the service until the next logon. Windows: `schtasks /End` ends only the launcher, so every other
 /// `serverq.exe` of the install folder goes too, except this process and the launcher running it (coreq.md § Service units).
 fn end(t: &coreq::Tool) -> Result<(), String> {
+    if cfg!(target_os = "macos") {
+        let u = unit(t);
+        let c = &u.stop[0];
+        let o = Command::new(&c[0]).args(&c[1..]).output().map_err(|e| e.to_string())?;
+        // launchctl reports ESRCH (3) when this label is already absent.
+        return if o.status.success() || o.status.code() == Some(3) { Ok(()) }
+        else { Err(format!("launchctl bootout failed: {}: {}", o.status, String::from_utf8_lossy(&o.stderr))) };
+    }
     if !cfg!(windows) {
         return systemctl(&["stop", UNIT]);
     }
@@ -283,9 +306,21 @@ fn install_task(t: &coreq::Tool) -> Result<i32, String> {
     Ok(0)
 }
 
+/// § 10: one LaunchAgent, no Linux migration or alternate install root.
+fn install_mac(t: &coreq::Tool) -> Result<i32, String> {
+    end(t)?;
+    coreq::update::install_self(t)?;
+    let u = unit(t);
+    coreq::service::write_unit(&u)?;
+    coreq::service::run_all(&u.load, false)?;
+    let (code, _) = check(&t.install, "/", false)?;
+    println!("installed LaunchAgent {}; check exit {code}", u.path.display());
+    Ok(0)
+}
+
 /// The one user unit; on Linux it keeps the Python units' resource caps and sandbox.
 fn unit(t: &coreq::Tool) -> coreq::service::Unit {
-    if cfg!(windows) {
+    if cfg!(windows) || cfg!(target_os = "macos") {
         return coreq::service::unit(t, &t.install, "serverq");
     }
     let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
@@ -474,6 +509,10 @@ fn serve(t: &coreq::Tool) -> Result<i32, String> {
 }
 
 fn hostname() -> String {
+    if cfg!(target_os = "macos") {
+        return Command::new("hostname").output().ok().filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+    }
     fs::read_to_string("/proc/sys/kernel/hostname")
         .or_else(|_| fs::read_to_string("/etc/hostname"))
         .or_else(|_| std::env::var("COMPUTERNAME"))
