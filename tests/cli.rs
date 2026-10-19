@@ -357,3 +357,65 @@ fn selftest_and_rules() {
     let rules = Command::new(env!("CARGO_BIN_EXE_serverq")).arg("rules").output().unwrap();
     assert_eq!(rules.stdout, fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("rules.json")).unwrap());
 }
+
+/// § 10: install owns one LaunchAgent; all lifecycle commands preserve data, reject alternate roots
+/// before host effects and report launchctl failure. The fake adapter never touches the user's service.
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_service_lifecycle() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = scratch("mac-service");
+    let bin = home.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let ctl = bin.join("launchctl");
+    fs::write(&ctl, r#"#!/bin/sh
+printf '%s\n' "$*" >> "$HOME/calls"
+[ -z "$FAIL_LAUNCHCTL" ] || exit 5
+case "$1" in
+bootout) [ -f "$HOME/loaded" ] || exit 3; rm "$HOME/loaded" ;;
+bootstrap) touch "$HOME/loaded" ;;
+*) exit 99 ;;
+esac
+"#).unwrap();
+    fs::set_permissions(&ctl, fs::Permissions::from_mode(0o700)).unwrap();
+    let install = home.join(".local/share/serverq");
+    let plist = home.join("Library/LaunchAgents/com.serverq.serverq.plist");
+    let run = |args: &[&str], fail: bool| {
+        Command::new(env!("CARGO_BIN_EXE_serverq")).args(args).env("HOME", &home)
+            .env_remove("SERVERQ_INSTALL").env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("FAIL_LAUNCHCTL", if fail { "1" } else { "" }).output().unwrap()
+    };
+    for cmd in ["install", "restart", "stop", "uninstall"] {
+        let o = run(&["service", cmd, "--home", home.to_str().unwrap()], false);
+        assert_eq!(o.status.code(), Some(2));
+    }
+    assert!(!home.join("calls").exists(), "alternate root must not touch the registered service");
+    let o = run(&["service", "install"], false);
+    assert_eq!(o.status.code(), Some(0), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(home.join("loaded").exists());
+    let xml = fs::read_to_string(&plist).unwrap();
+    assert!(xml.contains("<string>com.serverq.serverq</string>"));
+    assert!(xml.contains(&format!("<string>{}/serverq</string>", install.display())));
+    assert!(xml.contains("<string>service</string><string>run</string>"));
+    let original = fs::read(install.join("report.json")).unwrap();
+    let r: Value = serde_json::from_slice(&original).unwrap();
+    for id in ["failed-services", "bounded-docker-logs", "bounded-journal"] {
+        assert_eq!(r["results"][id]["reason"], "unsupported-os");
+    }
+    for cmd in ["restart", "stop", "stop", "restart", "install"] {
+        let o = run(&["service", cmd], false);
+        assert_eq!(o.status.code(), Some(0), "{cmd}: {}", String::from_utf8_lossy(&o.stderr));
+    }
+    for cmd in ["stop", "restart", "uninstall", "install"] {
+        assert_eq!(run(&["service", cmd], true).status.code(), Some(2));
+        assert!(plist.exists(), "failed unload must preserve the registration file");
+    }
+    assert_eq!(run(&["service", "uninstall"], false).status.code(), Some(0));
+    assert!(!plist.exists());
+    assert!(!home.join("loaded").exists());
+    assert!(install.join("report.json").exists(), "uninstall must preserve reports");
+    assert!(install.join("current").exists());
+    let calls = fs::read_to_string(home.join("calls")).unwrap();
+    assert!(calls.lines().all(|line| line.contains("com.serverq.serverq")));
+    fs::remove_dir_all(home).unwrap();
+}
