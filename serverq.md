@@ -27,6 +27,7 @@ serverq checks a Linux server against the agreed server-care rules and reports d
 | `serverq disconnect` | Stops sending at once and revokes through coreq | 0 revoked or never connected; 1 `Disconnected locally; revocation pending`; 2 error |
 | `serverq update` | coreq update (§ 4) | coreq |
 | `serverq rollback` | coreq rollback: `previous` into `current`, then `service pause` (§ 4) | coreq |
+| `serverq doctor` | Checks each host requirement of this OS (§ 11): one line per tool, `ok\|fail <tool> found <version\|present\|missing\|unreadable> minimum <version\|os> for <needs>`, with `; fix: <step>` on a failure; never runs a check | 0 every requirement met; 2 any missing, below minimum or unreadable |
 | `serverq selftest` | coreq harness: the embedded `rules.json` parses and one `check` in a temporary install, deleted afterwards, completes with a report naming every automated rule, whatever their status | 0 pass; 2 fails |
 | `serverq service install\|run\|pause\|resume\|status\|restart\|stop\|uninstall` | coreq service (§ 5) | 0 done; 2 error or, for `status`, unknown |
 
@@ -48,7 +49,7 @@ Checks, in the order of `rules.json`:
 | `bounded-journal` | `systemd-analyze cat-config systemd/journald.conf`: positive `SystemMaxUse`, `SystemKeepFree`, `RuntimeMaxUse` | yes, `ttl_seconds` |
 
 - Docker: `json-file`/`local` need positive `max-size` and `max-file`; `journald` and `none` pass; other drivers are `unknown`; a socket without the CLI is `unknown`; no daemon is `ok`. Rootless daemons stay a manual inventory item.
-- Commands run without a shell, with a 15 s timeout; a nonzero exit or timeout is `unknown` for that rule.
+- Commands run without a shell, with a 15 s timeout; a nonzero exit or timeout is `unknown` for that rule. Its `detail` names the command (at most 200 characters) and the error: the spawn error, the exit with the first 300 characters of stderr, or the timeout.
 - Cache: key, fingerprint of the probed config files, time. A hit needs the same fingerprint and an age in `[0, ttl)`. An `unknown` result is never cached. `--force`, or a `revision` different from the stored one, clears the cache. `revision` = sha256 of the embedded `rules.json` bytes plus the binary version.
 - Incidents per rule: a `warn` opens or continues `{first_seen, last_seen, occurrences, state: observed}`; a later `ok` sets `state: verified, verified_at`. They survive restarts.
 - `report.json` schema 1: `schema`, `at` (Unix seconds), `revision`, `catalog` (sha256 of the embedded `rules.json` bytes; additive), `filesystem`, `results` (`status` `ok|warn|unknown`, `detail`, probe fields, `cached`, `checked_at` for cached rules, `reason` on every non-`ok` result; additive), `incidents`, `manual_rules`.
@@ -84,7 +85,7 @@ One OS unit replaces `serverq-check.service`, `serverq-check.timer`, `serverq-up
 - The unit keeps the Python resource caps and sandbox: `UMask=0077`, `NoNewPrivileges=yes`, `PrivateTmp=yes`, `ProtectSystem=strict`, `ReadWritePaths=<install>`, `MemoryMax=128M`, `TasksMax=32`.
 - `service run` loop: a check 5 min after start, then every `check_every` (3600 s); the coreq update check 15 min after start, then every `update_every` (86400 s). Env `SERVERQ_CHECK_EVERY` and `SERVERQ_UPDATE_EVERY` (seconds) override the periods for tests; each first pass waits at most its period. One loop: a check and an update never overlap. A check result 1 is a normal pass, not a service failure. An installed update exits 75 and systemd starts the new `current`. Each pass prints one line to the journal.
 - `pause` writes `<install>/paused` and stops updates only; checks continue, since stopping them would hide deviations. `resume` removes it. `restart`, `stop` and `uninstall` run `systemctl --user restart`, `stop` and `disable --now`; `uninstall` also deletes the unit file, never the install folder.
-- `<install>/status.json` (coreq common keys, `project` `serverq`) adds `check`: `at`, `exit`, counts per status, `report` path, and `update_at`, `paused`. `error` holds the last check or update failure. Missing, unreadable, or a check older than 2 × `check_every`, reads unknown with a reason. `service status` prints `Check: ok|warn|unknown <age>` and `Update: <version|up to date|paused|unknown>`.
+- `<install>/status.json` (coreq common keys, `project` `serverq`) adds `check`: `at`, `exit`, counts per status, `report` path, and `update_at`, `paused`. `error` holds the last check, update or requirement failure (§ 11). Missing, unreadable, or a check older than 2 × `check_every`, reads unknown with a reason. `service status` prints `Check: ok|warn|unknown <age>` and `Update: <version|up to date|paused|unknown>`.
 - Connection: `<install>/connection/` holds coreq's `connection.json` (first seeded with `<install>/installation`, so the grant and the projection name one installation), `lock`, `snapshot.json`, the latest unsent record (schema `serverq-report/1`, event ID `r-` plus 32 hex of the payload's sha256, observed at the report's `at`), and `sent.json`, the last accepted one. With an active connection, each completed check replaces `snapshot.json` (coalesced: an older unsent one is dropped) and delivers it; `rejected` ends it; a transient failure retries after coreq's backoff without moving the check or update schedule. Every pass retries queued revokes. Delivery never changes a check result, its exit or its schedule; its outcome is one journal line. No heartbeat between checks: DashQ shows the report stale by its own observation time.
 - Monitors read `report.json` or `status.json`; serverq adds no second scheduler, cleaner or notifier.
 
@@ -117,7 +118,7 @@ A Windows host runs the service and reports the Linux-only rules as unknown; Win
 
 ## 8. Checks
 
-`cargo test --locked`, then `serverq selftest`, then `serverq check --home <temp>` on the authorized host. Tests cover enroll, coalesced delivery, receipts, crash recovery, cross-workspace reconnect and offline disconnect against a fake DashQ, each rule's `ok`/`warn`/`unknown`, cache hit, TTL and revision invalidation, corrupt state, exit codes, the migration steps against a fake legacy folder, and update then rollback of an enrolled install against a fake release served by a fake `curl`. Linux-only service tests compile only on Linux; on other OSes the CLI test asserts `unsupported-os`. CI runs the tests on Linux, Windows and macOS aarch64; the Scheduled Task is verified on the authorized Windows host.
+`cargo test --locked`, then `serverq selftest`, then `serverq check --home <temp>` on the authorized host. Tests cover enroll, coalesced delivery, receipts, crash recovery, cross-workspace reconnect and offline disconnect against a fake DashQ, each rule's `ok`/`warn`/`unknown`, cache hit, TTL and revision invalidation, corrupt state, exit codes, the migration steps against a fake legacy folder, update then rollback of an enrolled install against a fake release served by a fake `curl`, and `doctor` against tool fakes at, below and missing each minimum. Linux-only service tests compile only on Linux; on other OSes the CLI test asserts `unsupported-os`. CI runs the tests on Linux, Windows and macOS aarch64; the Scheduled Task is verified on the authorized Windows host.
 
 ## 9. Profiling
 
@@ -135,7 +136,7 @@ serverq follows [specq built-in profiling](https://github.com/taskqorg/specq/blo
 | | `probe.systemctl`, `probe.systemd-analyze` | 2 s | 1% |
 | | `probe.docker` (each docker CLI call) | 5 s | 1% |
 
-- Counters are always on. Each process keeps its samples in memory and merges them into `<install>/profile.json` when its command or service pass ends, only when `<install>` already exists; `selftest`, `profile` and the connection commands (`enroll`, `connection status`, `disconnect`: they wait on the network and the owner's approval) record nothing. Concurrent writers may lose a sample, never corrupt the file.
+- Counters are always on. Each process keeps its samples in memory and merges them into `<install>/profile.json` when its command or service pass ends, only when `<install>` already exists; `selftest`, `profile`, `doctor` and the connection commands (`enroll`, `connection status`, `disconnect`: they wait on the network and the owner's approval) record nothing. Concurrent writers may lose a sample, never corrupt the file.
 - `profile.json` schema 1, per operation: `count`, `failed`, `errors` (class to count), `first`, `last` (Unix seconds) and `ms`, the last 200 durations. Each merge rebuilds the file from valid records of the operation names above with only these fields, so the file stays bounded and foreign content is dropped. A record is malformed when an error class is not listed below, error counts do not sum to `failed`, `failed` exceeds `count`, it holds more durations than `count` or 200, or a duration or time is negative, non-finite or `first` is after `last`. An unreadable file or malformed record is replaced by the next merge.
 - An outcome is `ok` or `failed` with an error class: `timeout`, `exit-nonzero`, `not-found`, `lock-busy`, `invalid-state`, `unknown-result` (a `check` that completed with an `unknown` rule) or `error`. serverq never retries, so no operation counts as retried. No message text, path, unit name or container ID is stored.
 - Detailed traces: while the file `<install>/trace` exists, each merge also appends one line per call to `<install>/trace.jsonl` (`op`, `at`, `ms`, `error`), pruned to the last 1000 lines. Off by default; delete `trace` to stop.
@@ -148,3 +149,22 @@ serverq follows [specq built-in profiling](https://github.com/taskqorg/specq/blo
 - The LaunchAgent uses `RunAtLoad` and `KeepAlive`, the install folder as its working directory and `serverq.log` there for output. It needs a logged-in GUI user, no admin. Linux sandbox and resource caps do not apply. Install/reinstall stops only this label, writes the unit, bootstraps it and runs one check. `stop` boots out this label; `restart` boots it out then bootstraps it; `uninstall` boots it out and removes only its plist, never install data. An absent label is harmless; other launchctl failures are errors. Rollback is § 4.
 - Checks: disk and inode capacity run through `statvfs`; the three Linux-only rules remain `unknown` with `unsupported-os`, so a completed check exits 2. Manual rules remain unverified. The host label comes from `hostname`. The existing § 5 loop sends only the § 3 projection, retains its schedule and checks for updates; a missing macOS release artifact is an update error, never success.
 - Qualification: § 8 plus the macOS CLI lifecycle test with isolated HOME and fake launchctl (ownership, install, restart, stop, uninstall, refusal of other install folders and launchctl errors). On the authorized Mac, verify the native LaunchAgent, recovery, a projected receipt and matching DashQ `/data`, and an update check. Removing the LaunchAgent reverses installation without deleting reports or credentials.
+
+## 11. Host requirements
+
+serverq follows [specq host requirements](https://github.com/taskqorg/specq/blob/main/engineering/release-contract.md#host-requirements). It runs these external tools on a host and links no library beyond the OS C library (static on Linux):
+
+| Tool | OS | Minimum | Needed by |
+|---|---|---|---|
+| `systemctl` (systemd) | Linux | 239 | `failed-services`, `service` |
+| `systemd-analyze` (systemd) | Linux | 239 (`cat-config`) | `bounded-journal` |
+| `docker` CLI | Linux, while `/var/run/docker.sock` exists | 1.13 (`container ls`) | `bounded-docker-logs` |
+| `curl` | every OS | 7.20.2 (`--proto`) | `update`, `enroll`, delivery (coreq) |
+| `launchctl`, `id`, `hostname` | macOS | shipped with the OS | `service`, host label |
+| `schtasks`, `powershell`, `whoami`, `icacls` | Windows | shipped with the OS | `service`, connection folder ACL (coreq) |
+
+- Version: the first token of the first line of `<tool> --version` that starts with a digit, cut to its digits and dots, compared numerically. An OS-shipped tool is checked for presence on `PATH` only.
+- Not checked: the browser opener of `enroll` (`xdg-open`, `open`, `rundll32`); `--headless` and the printed link cover its absence.
+- Fix: serverq is read-only (§ 1) and runs as the user, so it never installs or upgrades a system package. `service install` (onboarding), `serverq update` and each service update pass run the doctor and print every failed requirement with its fix step (the service: one journal line and `requirements: ...` in `status.json` `error`); the doctor stays failed until the operator applies the step. Install and update still complete.
+- A change that starts using a new tool, flag or option raises its minimum here in the same change; tests cover each minimum and a missing tool.
+- A failed external call names its command and error (§ 3 for probes; service and launchctl errors carry the command and its stderr); no failure reads as an empty result. coreq's own calls follow coreq.md.
