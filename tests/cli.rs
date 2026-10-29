@@ -350,6 +350,57 @@ fn service_install_migrates_runs_updates_and_rolls_back() {
     assert!(!home.join(".config/systemd/user/serverq.service").exists() && install.join("current").exists(), "uninstall keeps the install folder");
 }
 
+/// serverq.md § 11 against tool fakes on an isolated PATH: each tool at its minimum passes; one below its minimum, one
+/// missing and one failing `--version` fail with tool, found version, minimum and fix, and exit 2.
+#[cfg(unix)]
+#[test]
+fn doctor_checks_host_requirements() {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = scratch("doctor");
+    let fake = |name: &str, script: &str| {
+        let p = bin.join(name);
+        fs::write(&p, format!("#!/bin/sh\n{script}\n")).unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    let doctor = || {
+        let o = Command::new(env!("CARGO_BIN_EXE_serverq")).args(["doctor", "--home"]).arg(bin.join("home")).env("PATH", &bin).output().unwrap();
+        (o.status.code(), String::from_utf8_lossy(&o.stdout).into_owned())
+    };
+    let oldest = [("curl", "echo 'curl 7.20.2 (fake) libcurl/7.20.2'"), ("systemctl", "echo 'systemd 239'"), ("systemd-analyze", "echo 'systemd 239'"), ("docker", "echo 'Docker version 1.13.1, build fake'")];
+    for (name, script) in oldest {
+        fake(name, script);
+    }
+    for name in ["launchctl", "id", "hostname"] {
+        fake(name, "exit 0");
+    }
+    let (code, out) = doctor();
+    assert_eq!(code, Some(0), "{out}");
+    assert!(out.lines().all(|l| l.starts_with("ok ")) && out.contains("ok curl found 7.20.2 minimum 7.20.2 for update, enroll, delivery"), "{out}");
+    if cfg!(target_os = "linux") {
+        assert!(out.contains("ok systemd-analyze found 239 minimum 239 for bounded-journal"), "{out}");
+    }
+
+    fake("curl", "echo 'curl 7.19.7 (fake)'");
+    let (code, out) = doctor();
+    assert_eq!(code, Some(2));
+    assert!(out.contains("fail curl found 7.19.7 minimum 7.20.2 for update, enroll, delivery; fix: install or upgrade the OS curl package to 7.20.2 or newer"), "{out}");
+
+    fake("curl", "echo 'curl: broken install' >&2; exit 1");
+    assert!(doctor().1.contains("fail curl found unreadable (`curl --version` collection failed: exit 1: curl: broken install) minimum 7.20.2"));
+
+    fs::remove_file(bin.join("curl")).unwrap();
+    let (code, out) = doctor();
+    assert_eq!(code, Some(2));
+    assert!(out.contains("fail curl found missing minimum 7.20.2 for update, enroll, delivery; fix: "), "{out}");
+    if cfg!(target_os = "linux") {
+        fake("systemctl", "echo 'systemd 238'");
+        assert!(doctor().1.contains("fail systemctl found 238 minimum 239 for failed-services, service; fix: upgrade the OS to a release with systemd 239 or newer"));
+    } else {
+        fs::remove_file(bin.join("launchctl")).unwrap();
+        assert!(doctor().1.contains("fail launchctl found missing minimum os for service; fix: restore launchctl, which ships with macos"));
+    }
+}
+
 #[test]
 fn selftest_and_rules() {
     let out = Command::new(env!("CARGO_BIN_EXE_serverq")).arg("selftest").output().unwrap();

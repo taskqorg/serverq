@@ -14,7 +14,7 @@ mod profile;
 const RULES: &[u8] = include_bytes!("../rules.json");
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DOCKER: [&str; 3] = ["docker", "--host", "unix:///var/run/docker.sock"];
-const USAGE: &str = "usage: serverq check [--force] [--filesystem PATH] | rules | projection | enroll URL [--headless] | connection status | disconnect | profile | update | rollback | selftest | service install|run|pause|resume|status|restart|stop|uninstall; every command takes --home PATH";
+const USAGE: &str = "usage: serverq check [--force] [--filesystem PATH] | rules | projection | enroll URL [--headless] | connection status | disconnect | profile | doctor | update | rollback | selftest | service install|run|pause|resume|status|restart|stop|uninstall; every command takes --home PATH";
 const UNIT: &str = "serverq.service";
 const LEGACY_UNITS: [&str; 4] = ["serverq-check.timer", "serverq-update.timer", "serverq-check.service", "serverq-update.service"];
 const LINUX: bool = cfg!(target_os = "linux");
@@ -93,7 +93,7 @@ fn run(args: &[String]) -> Result<i32, String> {
     let op = match words[..] {
         _ if parsed.is_err() => "cli.other".into(),
         [w @ ("check" | "rules" | "projection" | "update" | "rollback")] => format!("cli.{w}"),
-        ["selftest" | "profile" | "disconnect"] | ["enroll", _] | ["connection", "status"] | ["service", "run"] => String::new(),
+        ["selftest" | "profile" | "doctor" | "disconnect"] | ["enroll", _] | ["connection", "status"] | ["service", "run"] => String::new(),
         ["service", _] => "cli.service".into(),
         _ => "cli.other".into(),
     };
@@ -131,7 +131,15 @@ fn dispatch(t: &coreq::Tool, words: &[&str], filesystem: &str, force: bool, head
         ["enroll", url] => enroll(&t.install, url, &mut coreq::enroll::Https { browser: !headless }),
         ["connection", "status"] => connection_status(&t.install, &mut coreq::enroll::Https { browser: false }),
         ["disconnect"] => disconnect(&t.install, &mut coreq::enroll::Https { browser: false }),
+        ["doctor"] => {
+            let lines = doctor();
+            for (_, l) in &lines {
+                println!("{l}");
+            }
+            Ok(if lines.iter().all(|(ok, _)| *ok) { 0 } else { 2 })
+        }
         ["update"] => {
+            print_unmet();
             match coreq::update::update(t, false)? {
                 Some(v) => println!("serverq: updated to {v}"),
                 None => println!("serverq: up to date"),
@@ -170,6 +178,88 @@ fn selftest() -> Result<i32, String> {
     }
     println!("serverq {VERSION} selftest passed; check exit {code}");
     Ok(0)
+}
+
+/// One external tool of this OS (serverq.md § 11): name, minimum version (empty: shipped with the OS, presence only), what needs it.
+fn needs() -> Vec<(&'static str, &'static str, &'static str)> {
+    let mut v = vec![("curl", "7.20.2", "update, enroll, delivery")];
+    if LINUX {
+        v.extend([("systemctl", "239", "failed-services, service"), ("systemd-analyze", "239", "bounded-journal")]);
+        if Path::new("/var/run/docker.sock").exists() {
+            v.push(("docker", "1.13", "bounded-docker-logs"));
+        }
+    } else if cfg!(target_os = "macos") {
+        v.extend([("launchctl", "", "service"), ("id", "", "service"), ("hostname", "", "host label")]);
+    } else if cfg!(windows) {
+        v.extend([("schtasks", "", "service"), ("powershell", "", "service"), ("whoami", "", "service, connection"), ("icacls", "", "connection")]);
+    }
+    v
+}
+
+/// The operator's step for a failed requirement; serverq itself never installs a system package (serverq.md § 1).
+fn fix(tool: &str, min: &str) -> String {
+    match tool {
+        _ if min.is_empty() => format!("restore {tool}, which ships with {}", std::env::consts::OS),
+        "systemctl" | "systemd-analyze" => format!("upgrade the OS to a release with systemd {min} or newer"),
+        "docker" => format!("install or upgrade the Docker CLI package (docker-ce-cli or docker.io) to {min} or newer"),
+        _ if cfg!(windows) => format!("put {tool}.exe {min} or newer on PATH (it ships with Windows 10 1803 and later)"),
+        _ => format!("install or upgrade the OS {tool} package to {min} or newer"),
+    }
+}
+
+/// `--version` output: the first token of the first line that starts with a digit, cut to its digits and dots.
+fn version(out: &str) -> Option<String> {
+    let token = out.lines().next()?.split_whitespace().find(|w| w.starts_with(|c: char| c.is_ascii_digit()))?;
+    Some(token.chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect::<String>().trim_end_matches('.').to_string())
+}
+
+fn at_least(found: &str, min: &str) -> bool {
+    let parts = |s: &str| s.split('.').map(|p| p.parse::<u64>().unwrap_or(0)).collect::<Vec<_>>();
+    let (mut a, mut b) = (parts(found), parts(min));
+    let n = a.len().max(b.len());
+    a.resize(n, 0);
+    b.resize(n, 0);
+    a >= b
+}
+
+/// serverq.md § 11: one line per requirement and whether it holds. Version probes are not profiled: they are no audit probe.
+fn doctor() -> Vec<(bool, String)> {
+    needs()
+        .into_iter()
+        .map(|(tool, min, needs)| {
+            let (found, ok) = if min.is_empty() {
+                if which(tool) { ("present".to_string(), true) } else { ("missing".to_string(), false) }
+            } else {
+                match run_probe(&[tool, "--version"]) {
+                    Ok(out) => match version(&out) {
+                        Some(v) => {
+                            let ok = at_least(&v, min);
+                            (v, ok)
+                        }
+                        None => (format!("unreadable (`{tool} --version` printed no version)"), false),
+                    },
+                    Err(e) if e.ends_with("NotFound") => ("missing".to_string(), false),
+                    Err(e) => (format!("unreadable ({e})"), false),
+                }
+            };
+            let mut line = format!("{} {tool} found {found} minimum {} for {needs}", if ok { "ok" } else { "fail" }, if min.is_empty() { "os" } else { min });
+            if !ok {
+                line += &format!("; fix: {}", fix(tool, min));
+            }
+            (ok, line)
+        })
+        .collect()
+}
+
+/// Install and update report each failed requirement with its fix and still complete; `doctor` stays failed (serverq.md § 11).
+fn unmet() -> Vec<String> {
+    doctor().into_iter().filter(|(ok, _)| !ok).map(|(_, l)| l).collect()
+}
+
+fn print_unmet() {
+    for l in unmet() {
+        println!("serverq: requirement {l}");
+    }
 }
 
 /// `previous` becomes `current`, updates pause and an installed service restarts on the restored release.
@@ -222,7 +312,9 @@ fn service(t: &coreq::Tool, cmd: &str) -> Result<i32, String> {
                 coreq::service::run_all(&u.unload, true)?;
             }
             // a task this user may not delete (registered elevated) must not read as uninstalled
-            if cfg!(windows) && coreq::quiet(Command::new("schtasks").args(["/Query", "/TN", TASK]).stdout(Stdio::null()).stderr(Stdio::null())).status().is_ok_and(|s| s.success()) {
+            if cfg!(windows)
+                && coreq::quiet(Command::new("schtasks").args(["/Query", "/TN", TASK]).stdout(Stdio::null()).stderr(Stdio::null())).status().map_err(|e| format!("`schtasks /Query /TN {TASK}`: {e}"))?.success()
+            {
                 return Err(format!("Scheduled Task {TASK} is still registered; delete it from the account that registered it"));
             }
             if let Err(e) = fs::remove_file(&u.path)
@@ -262,10 +354,10 @@ fn end(t: &coreq::Tool) -> Result<(), String> {
     if cfg!(target_os = "macos") {
         let u = unit(t);
         let c = &u.stop[0];
-        let o = Command::new(&c[0]).args(&c[1..]).output().map_err(|e| e.to_string())?;
+        let o = Command::new(&c[0]).args(&c[1..]).output().map_err(|e| format!("`{}`: {e}", c.join(" ")))?;
         // launchctl reports ESRCH (3) when this label is already absent.
         return if o.status.success() || o.status.code() == Some(3) { Ok(()) }
-        else { Err(format!("launchctl bootout failed: {}: {}", o.status, String::from_utf8_lossy(&o.stderr))) };
+        else { Err(format!("`{}` failed: {}: {}", c.join(" "), o.status, String::from_utf8_lossy(&o.stderr).trim())) };
     }
     if !cfg!(windows) {
         return systemctl(&["stop", UNIT]);
@@ -303,6 +395,7 @@ fn install_task(t: &coreq::Tool) -> Result<i32, String> {
     println!("started Scheduled Task from {}", u.path.display());
     let (code, _) = check(&t.install, "/", false)?;
     println!("check exit {code}, report {}", t.install.join("report.json").display());
+    print_unmet();
     Ok(0)
 }
 
@@ -315,6 +408,7 @@ fn install_mac(t: &coreq::Tool) -> Result<i32, String> {
     coreq::service::run_all(&u.load, false)?;
     let (code, _) = check(&t.install, "/", false)?;
     println!("installed LaunchAgent {}; check exit {code}", u.path.display());
+    print_unmet();
     Ok(0)
 }
 
@@ -361,6 +455,7 @@ fn install(t: &coreq::Tool) -> Result<i32, String> {
     if migrated {
         println!("{rollback}");
     }
+    print_unmet();
     Ok(0)
 }
 
@@ -428,6 +523,7 @@ fn serve(t: &coreq::Tool) -> Result<i32, String> {
     let mut backoff = coreq::enroll::Backoff::default();
     let mut next_send = None;
     let (mut check_status, mut update_at, mut check_error, mut update_error): (Value, Value, Option<String>, Option<String>) = (Value::Null, Value::Null, None, None);
+    let mut need_error = None;
     // the launcher runs `releases/<ver>/serverq`; a first completed check marks that release healthy
     let healthy = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("healthy"))).filter(|h| h.parent().and_then(Path::parent) == Some(&t.install.join("releases")));
     println!("serverq {VERSION}: service started");
@@ -473,6 +569,11 @@ fn serve(t: &coreq::Tool) -> Result<i32, String> {
         } else if !retry {
             next_update += update_every;
             update_at = (now() as u64).into();
+            let unmet = unmet();
+            need_error = (!unmet.is_empty()).then(|| format!("requirements: {}", unmet.join("; ")));
+            if let Some(e) = &need_error {
+                println!("serverq: {e}");
+            }
             if paused {
                 println!("serverq: update paused");
             } else {
@@ -499,7 +600,7 @@ fn serve(t: &coreq::Tool) -> Result<i32, String> {
         profile::flush(&t.install);
         // the connection never changes a check result or the schedule; its outcome is one journal line
         next_send = connection_pass(&t.install, checked, &mut backoff, &mut coreq::enroll::Https { browser: false }).map(|s| Instant::now() + Duration::from_secs(s));
-        let error = [&check_error, &update_error].into_iter().flatten().cloned().collect::<Vec<_>>();
+        let error = [&check_error, &update_error, &need_error].into_iter().flatten().cloned().collect::<Vec<_>>();
         let mut s = coreq::status::common(t, &host, "serverq", now() as u64, (!error.is_empty()).then(|| error.join("; ")), None);
         s["check"] = check_status.clone();
         s["update_at"] = update_at.clone();
@@ -510,8 +611,11 @@ fn serve(t: &coreq::Tool) -> Result<i32, String> {
 
 fn hostname() -> String {
     if cfg!(target_os = "macos") {
-        return Command::new("hostname").output().ok().filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+        // a failure is logged with its command, never silently read as no name
+        return run_probe(&["hostname"]).map(|h| h.trim().to_string()).unwrap_or_else(|e| {
+            eprintln!("serverq: host label unknown: {e}");
+            String::new()
+        });
     }
     fs::read_to_string("/proc/sys/kernel/hostname")
         .or_else(|_| fs::read_to_string("/etc/hostname"))
@@ -918,16 +1022,23 @@ fn command(argv: &[&str]) -> Result<String, String> {
     r
 }
 
-/// Runs without a shell, 15 s timeout; spawn failure, nonzero exit or timeout is an error.
-fn run_probe(argv: &[&str]) -> Result<String, String> {
-    let fail = |why: String| format!("{} collection failed: {why}", argv[0]);
-    let mut child = Command::new(argv[0]).args(&argv[1..]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().map_err(|e| fail(format!("{:?}", e.kind())))?;
-    let mut out = child.stdout.take().ok_or_else(|| fail("no stdout".into()))?;
+/// Reads a child's pipe to its end on its own thread.
+fn drain(mut pipe: impl Read + Send + 'static) -> std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut buf = Vec::new();
-        let _ = tx.send(out.read_to_end(&mut buf).map(|_| buf));
+        let _ = tx.send(pipe.read_to_end(&mut buf).map(|_| buf));
     });
+    rx
+}
+
+/// Runs without a shell, 15 s timeout; spawn failure, nonzero exit or timeout is an error naming the command (serverq.md § 3).
+fn run_probe(argv: &[&str]) -> Result<String, String> {
+    let shown: String = argv.join(" ").chars().take(200).collect();
+    let fail = |why: String| format!("`{shown}` collection failed: {why}");
+    let mut child = Command::new(argv[0]).args(&argv[1..]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|e| fail(format!("{:?}", e.kind())))?;
+    let rx = drain(child.stdout.take().ok_or_else(|| fail("no stdout".into()))?);
+    let err = drain(child.stderr.take().ok_or_else(|| fail("no stderr".into()))?);
     let deadline = Instant::now() + Duration::from_secs(15);
     let status = loop {
         match child.try_wait().map_err(|e| fail(format!("{:?}", e.kind())))? {
@@ -940,24 +1051,27 @@ fn run_probe(argv: &[&str]) -> Result<String, String> {
             }
         }
     };
-    if !status.success() {
-        return Err(fail(status.code().map_or("signal".into(), |c| format!("exit {c}"))));
-    }
     // a grandchild holding the pipe open must not outlive the deadline either
     let left = deadline.saturating_duration_since(Instant::now());
+    if !status.success() {
+        let stderr = err.recv_timeout(left).ok().and_then(Result::ok).unwrap_or_default();
+        let stderr: String = String::from_utf8_lossy(&stderr).split_whitespace().collect::<Vec<_>>().join(" ").chars().take(300).collect();
+        let code = status.code().map_or("signal".into(), |c| format!("exit {c}"));
+        return Err(fail(if stderr.is_empty() { code } else { format!("{code}: {stderr}") }));
+    }
     let buf = rx.recv_timeout(left).map_err(|_| fail("timeout".into()))?.map_err(|e| fail(format!("{:?}", e.kind())))?;
     String::from_utf8(buf).map_err(|_| fail("invalid UTF-8".into()))
 }
 
-/// Only Linux probes look a program up.
+/// An executable `name` on PATH, as `Command` finds it.
 #[cfg(unix)]
 fn which(name: &str) -> bool {
     std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| fs::metadata(d.join(name)).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)))
 }
 
 #[cfg(windows)]
-fn which(_: &str) -> bool {
-    false
+fn which(name: &str) -> bool {
+    std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(format!("{name}.exe")).is_file()))
 }
 
 fn failed_units(output: Result<String, String>) -> Value {
@@ -1282,9 +1396,37 @@ mod tests {
         assert_eq!(status(&failed_units(command(&["false"]))), "unknown");
         #[cfg(unix)]
         assert_eq!(command(&["echo", "x"]), Ok("x\n".into()));
+        // serverq.md § 3: a failed probe names its command and stderr, and keeps its profile class
+        #[cfg(unix)]
+        {
+            let e = run_probe(&["sh", "-c", "echo 'no  daemon' >&2; exit 3"]).unwrap_err();
+            assert_eq!(e, "`sh -c echo 'no  daemon' >&2; exit 3` collection failed: exit 3: no daemon");
+            assert_eq!(profile::class(&e), "exit-nonzero");
+        }
+        let e = run_probe(&["serverq-no-such-command", "--version"]).unwrap_err();
+        assert_eq!((e.as_str(), profile::class(&e)), ("`serverq-no-such-command --version` collection failed: NotFound", "not-found"));
         let found = failed_units(Ok("a.service loaded failed failed A\n\nb.service loaded failed failed B\n".into()));
         assert_eq!((status(&found), &found["units"]), ("warn", &json!(["a.service", "b.service"])));
         assert_eq!(status(&failed_units(Ok(String::new()))), "ok");
+    }
+
+    /// serverq.md § 11: the real `--version` shapes of each listed tool; the oldest supported version passes, one below fails.
+    #[test]
+    fn requirement_versions() {
+        for (out, v) in [
+            ("systemd 239 (239-41.el8)\n+PAM +AUDIT\n", "239"),
+            ("Docker version 1.13.1, build 092cba3\n", "1.13.1"),
+            ("curl 7.20.2 (x86_64-pc-linux-gnu) libcurl/7.20.2\nRelease-Date: 2010-04-15\n", "7.20.2"),
+            ("curl 8.9.1 (Windows) libcurl/8.9.1 Schannel\n", "8.9.1"),
+        ] {
+            assert_eq!(version(out).as_deref(), Some(v), "{out}");
+        }
+        assert_eq!(version("usage: curl\n"), None);
+        assert_eq!(version(""), None);
+        for (found, min, ok) in [("239", "239", true), ("238", "239", false), ("1.13.1", "1.13", true), ("1.12.6", "1.13", false), ("7.20.2", "7.20.2", true), ("7.19.7", "7.20.2", false), ("7.100", "7.20.2", true), ("8", "7.20.2", true)] {
+            assert_eq!(at_least(found, min), ok, "{found} >= {min}");
+        }
+        assert!(needs().iter().any(|(t, m, _)| (*t, *m) == ("curl", "7.20.2")));
     }
 
     #[test]

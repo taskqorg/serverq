@@ -50,6 +50,7 @@ The install folder is `%LOCALAPPDATA%\serverq`; service output goes to `serverq.
 ```sh
 serverq check [--force] [--filesystem PATH]   # 0 ok, 1 warn, 2 unknown or failure
 serverq service status                        # Check: ok|warn|unknown <age>; Update: ...
+serverq doctor                                # host tools at their minimum versions (serverq.md § 11); 2 names the fix
 serverq update                                # install a newer release now
 serverq rollback                              # back to the previous release; pauses updates
 serverq service resume                        # updates again
