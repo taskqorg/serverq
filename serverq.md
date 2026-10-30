@@ -1,5 +1,4 @@
 # serverq contract
-<!-- contract-budget: bytes=61440 lines=200 -->
 
 serverq checks a Linux server against the agreed server-care rules and reports deviations to agents and monitors. It never repairs a server, takes commands or promises uptime (R2, R3, R8).
 
