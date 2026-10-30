@@ -137,8 +137,8 @@ A Windows host runs the service and reports the Linux-only rules as unknown; Win
 
 - **Unsupported is unknown (R1).** Every rule whose probe is Linux-only is `unknown` with `reason: unsupported-os`, never `ok`, so `check` exits 2. On Windows that is all five automated rules (no `statvfs`, systemd or system Docker socket); on macOS the three systemd and Docker rules.
 - **Projection only (R3).** DashQ receives the allowlisted projection through the shared enrollment client; never upload raw `status.json` or `report.json`.
-- Release: `serverq-<ver>-windows-x86_64.exe`, built and selftested like the Linux artifacts. Install folder `%LOCALAPPDATA%\serverq` (coreq default); `--home` other than the default is an error for `service`.
-- `service install` registers coreq's Scheduled Task `ServerQ-serverq` for this user's logon, `LeastPrivilege`, no admin; `uninstall` deletes it, never the install folder.
+- Release: `serverq-<ver>-windows-x86_64.exe`, built and selftested like the Linux artifacts. Install folder `%LOCALAPPDATA%\serverq` (coreq default).
+- `service install` registers coreq's Scheduled Task `ServerQ-serverq` for this user's logon, `LeastPrivilege`, no admin; the task runs `service run` without arguments, so `--home` other than the default is an error for `service install`. `uninstall` deletes the task, never the install folder.
 
 ## 8. macOS
 

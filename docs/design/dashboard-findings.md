@@ -27,7 +27,7 @@ Common gaps:
 
 ## 2. Identity, time, evidence, recommendation
 
-Proposed additive fields; old readers ignore them (serverq.md § 4 N/N-1).
+Proposed additive fields; old readers ignore them (serverq.md R7 N/N-1).
 
 - Installation: `<install>/installation`, 32 random hex written once by `check` or `service install`, never derived from host name, path or user. Same pattern as agentq `data/installation`.
 - Rule ID: the `rules.json` key, unchanged. Already stable and used in `results`, `incidents` and `manual_rules`.
