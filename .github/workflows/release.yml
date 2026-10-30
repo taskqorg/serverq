@@ -1,4 +1,4 @@
-# serverq.md § 4 Release: one static Linux binary per arch, a Windows binary (§ 7), a macOS aarch64 binary (§ 10), SHA256SUMS, latest.json, a build provenance attestation per binary and SHA256SUMS. A failing selftest publishes nothing.
+# serverq.md § 4 Release: one static Linux binary per arch, a Windows binary (§ 7), a macOS aarch64 binary (§ 8), SHA256SUMS, latest.json, a build provenance attestation per binary and SHA256SUMS. A failing selftest publishes nothing.
 name: release
 on:
   push:
@@ -18,7 +18,7 @@ jobs:
             arch: aarch64
             target: aarch64-unknown-linux-musl
             name: linux-aarch64
-          - os: macos-14
+          - os: macos-15
             arch: aarch64
             target: aarch64-apple-darwin
             name: macos-aarch64

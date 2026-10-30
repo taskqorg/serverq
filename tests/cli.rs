@@ -242,7 +242,7 @@ fn enrollment_recovers_from_crashes() {
     }
 }
 
-/// serverq.md § 5, § 6 and § 4 against a fake legacy folder, a fake `systemctl` and a fake release served by a fake `curl`.
+/// serverq.md § 5, § 4 and docs/design/migration.md against a fake legacy folder, a fake `systemctl` and a fake release served by a fake `curl`.
 #[cfg(target_os = "linux")]
 #[test]
 fn service_install_migrates_runs_updates_and_rolls_back() {
@@ -350,7 +350,7 @@ fn service_install_migrates_runs_updates_and_rolls_back() {
     assert!(!home.join(".config/systemd/user/serverq.service").exists() && install.join("current").exists(), "uninstall keeps the install folder");
 }
 
-/// serverq.md § 11 against tool fakes on an isolated PATH: each tool at its minimum passes; one below its minimum, one
+/// serverq.md § 6 against tool fakes on an isolated PATH: each tool at its minimum passes; one below its minimum, one
 /// missing and one failing `--version` fail with tool, found version, minimum and fix, and exit 2.
 #[cfg(unix)]
 #[test]
@@ -409,7 +409,7 @@ fn selftest_and_rules() {
     assert_eq!(rules.stdout, fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("rules.json")).unwrap());
 }
 
-/// § 10: install owns one LaunchAgent; all lifecycle commands preserve data, reject alternate roots
+/// serverq.md § 8: install owns one LaunchAgent; all lifecycle commands preserve data, reject alternate roots
 /// before host effects and report launchctl failure. The fake adapter never touches the user's service.
 #[cfg(target_os = "macos")]
 #[test]

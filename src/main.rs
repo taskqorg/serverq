@@ -28,7 +28,7 @@ const REASONS: [&str; 9] = [UNSUPPORTED, COLLECTION, "capacity-unavailable", "be
 
 type Obj = Map<String, Value>;
 
-/// Windows has no Unix modes: the install folder under `%LOCALAPPDATA%` keeps the user's ACL (serverq.md § 7).
+/// Windows has no Unix modes: the install folder under `%LOCALAPPDATA%` keeps the user's ACL (serverq.md § 7, docs/design/platforms.md).
 #[cfg(windows)]
 trait Mode {
     fn mode(&mut self, _: u32) -> &mut Self {
@@ -180,7 +180,7 @@ fn selftest() -> Result<i32, String> {
     Ok(0)
 }
 
-/// One external tool of this OS (serverq.md § 11): name, minimum version (empty: shipped with the OS, presence only), what needs it.
+/// One external tool of this OS (serverq.md § 6): name, minimum version (empty: shipped with the OS, presence only), what needs it.
 fn needs() -> Vec<(&'static str, &'static str, &'static str)> {
     let mut v = vec![("curl", "7.20.2", "update, enroll, delivery")];
     if LINUX {
@@ -222,7 +222,7 @@ fn at_least(found: &str, min: &str) -> bool {
     a >= b
 }
 
-/// serverq.md § 11: one line per requirement and whether it holds. Version probes are not profiled: they are no audit probe.
+/// serverq.md § 6: one line per requirement and whether it holds. Version probes are not profiled: they are no audit probe.
 fn doctor() -> Vec<(bool, String)> {
     needs()
         .into_iter()
@@ -251,7 +251,7 @@ fn doctor() -> Vec<(bool, String)> {
         .collect()
 }
 
-/// Install and update report each failed requirement with its fix and still complete; `doctor` stays failed (serverq.md § 11).
+/// Install and update report each failed requirement with its fix and still complete; `doctor` stays failed (serverq.md § 6).
 fn unmet() -> Vec<String> {
     doctor().into_iter().filter(|(ok, _)| !ok).map(|(_, l)| l).collect()
 }
@@ -295,7 +295,7 @@ fn service(t: &coreq::Tool, cmd: &str) -> Result<i32, String> {
         },
         "status" => return service_status(t),
         "run" => return serve(t),
-        _ if !LINUX && !cfg!(windows) && !cfg!(target_os = "macos") => return Err("the service requires Linux, Windows or macOS (serverq.md § 5, § 7, § 10)".into()),
+        _ if !LINUX && !cfg!(windows) && !cfg!(target_os = "macos") => return Err("the service requires Linux, Windows or macOS (serverq.md § 5, § 7, § 8)".into()),
         "install" if cfg!(target_os = "macos") => return install_mac(t),
         "install" if cfg!(windows) => return install_task(t),
         "install" => return install(t),
@@ -399,7 +399,7 @@ fn install_task(t: &coreq::Tool) -> Result<i32, String> {
     Ok(0)
 }
 
-/// § 10: one LaunchAgent, no Linux migration or alternate install root.
+/// serverq.md § 8: one LaunchAgent, no Linux migration or alternate install root.
 fn install_mac(t: &coreq::Tool) -> Result<i32, String> {
     end(t)?;
     coreq::update::install_self(t)?;
@@ -433,7 +433,7 @@ fn unit(t: &coreq::Tool) -> coreq::service::Unit {
     }
 }
 
-/// serverq.md § 5 and § 6: migrate a legacy `~/.serverq` once, install this binary, start the unit, run one check.
+/// serverq.md § 5 and docs/design/migration.md: migrate a legacy `~/.serverq` once, install this binary, start the unit, run one check.
 fn install(t: &coreq::Tool) -> Result<i32, String> {
     let legacy = PathBuf::from(std::env::var_os("HOME").ok_or("HOME is not set")?).join(".serverq");
     let real = fs::symlink_metadata(&legacy).is_ok_and(|m| m.is_dir());
@@ -459,7 +459,7 @@ fn install(t: &coreq::Tool) -> Result<i32, String> {
     Ok(0)
 }
 
-/// Steps 1-5 of serverq.md § 6; returns the held legacy lock. A failure before step 5 restores the legacy timers.
+/// Steps 1-5 of docs/design/migration.md; returns the held legacy lock. A failure before step 5 restores the legacy timers.
 fn migrate(t: &coreq::Tool, legacy: &Path) -> Result<File, String> {
     let held = OpenOptions::new().append(true).create(true).mode(0o600).open(legacy.join("lock")).map_err(|e| format!("legacy lock: {e}"))?;
     held.try_lock().map_err(|_| "the legacy serverq is running; retry after it ends")?;
@@ -1410,7 +1410,7 @@ mod tests {
         assert_eq!(status(&failed_units(Ok(String::new()))), "ok");
     }
 
-    /// serverq.md § 11: the real `--version` shapes of each listed tool; the oldest supported version passes, one below fails.
+    /// serverq.md § 6: the real `--version` shapes of each listed tool; the oldest supported version passes, one below fails.
     #[test]
     fn requirement_versions() {
         for (out, v) in [

@@ -3,10 +3,17 @@ on: [push, pull_request, merge_group]
 permissions:
   contents: read
 jobs:
+  contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with: {repository: taskqorg/specq, ref: 7e9adf57287553176d8b3be61c2b22565543dc51, path: .specq}
+      - run: python3 .specq/engineering/scripts/contract_lint.py serverq.md
   rust:
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-14]
+        os: [ubuntu-latest, windows-latest, macos-15]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
