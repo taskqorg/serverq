@@ -25,7 +25,7 @@ gh attestation verify "serverq-$ver-linux-$arch" --repo taskqorg/serverq   # opt
 chmod +x "serverq-$ver-linux-$arch" && "./serverq-$ver-linux-$arch" service install
 ```
 
-`service install` moves a legacy `~/.serverq` (serverq.md § 6): it stops the four Python units, copies state and report, keeps the old folder as `~/.local/share/serverq/legacy` and links `~/.serverq` to the new folder, then starts `serverq.service` and runs one check. It prints every step and the exact rollback. A host that must check without a login session needs `loginctl enable-linger <user>`.
+`service install` moves a legacy `~/.serverq` ([migration](docs/design/migration.md)): it stops the four Python units, copies state and report, keeps the old folder as `~/.local/share/serverq/legacy` and links `~/.serverq` to the new folder, then starts `serverq.service` and runs one check. It prints every step and the exact rollback. A host that must check without a login session needs `loginctl enable-linger <user>`.
 
 ## Windows
 
@@ -50,7 +50,7 @@ The install folder is `%LOCALAPPDATA%\serverq`; service output goes to `serverq.
 ```sh
 serverq check [--force] [--filesystem PATH]   # 0 ok, 1 warn, 2 unknown or failure
 serverq service status                        # Check: ok|warn|unknown <age>; Update: ...
-serverq doctor                                # host tools at their minimum versions (serverq.md § 11); 2 names the fix
+serverq doctor                                # host tools at their minimum versions (serverq.md § 6); 2 names the fix
 serverq update                                # install a newer release now
 serverq rollback                              # back to the previous release; pauses updates
 serverq service resume                        # updates again
