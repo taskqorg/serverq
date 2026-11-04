@@ -10,24 +10,25 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: '["self-hosted", "Linux", "X64", "serverq-wsl"]'
             arch: x86_64
             target: x86_64-unknown-linux-musl
             name: linux-x86_64
-          - os: ubuntu-24.04-arm
+          # No local Linux arm64 host.
+          - os: '"ubuntu-24.04-arm"'
             arch: aarch64
             target: aarch64-unknown-linux-musl
             name: linux-aarch64
-          - os: macos-15
+          - os: '["self-hosted", "macOS", "ARM64", "taskq-mac"]'
             arch: aarch64
             target: aarch64-apple-darwin
             name: macos-aarch64
-          - os: windows-latest
+          - os: '["self-hosted", "Windows", "X64", "serverq-win"]'
             arch: x86_64
             target: x86_64-pc-windows-msvc
             name: windows-x86_64
             ext: .exe
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ fromJSON(matrix.os) }}
     defaults:
       run:
         shell: bash
@@ -36,7 +37,10 @@ jobs:
       TARGET: ${{ matrix.target }}
     steps:
       - uses: actions/checkout@v4
-      - if: runner.os == 'Linux'
+      # The Mac runner's .env also serves tests.yml, which expects target/ in the workspace.
+      - if: runner.environment == 'self-hosted' && runner.os == 'macOS'
+        run: echo "CARGO_TARGET_DIR=$HOME/release-target" >> "$GITHUB_ENV"
+      - if: runner.os == 'Linux' && runner.environment == 'github-hosted'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: rustup update stable --no-self-update && rustup default stable && rustup target add "$TARGET"
       - name: Version from tag
@@ -49,7 +53,7 @@ jobs:
       - run: cargo build --release --target "$TARGET"
       - name: Selftest and stage
         run: |
-          bin="target/$TARGET/release/serverq${{ matrix.ext }}"
+          bin="${CARGO_TARGET_DIR:-target}/$TARGET/release/serverq${{ matrix.ext }}"
           [ "$RUNNER_OS" != Linux ] || file "$bin" | grep -Eq 'static(ally|-pie) linked'
           "$bin" selftest
           mkdir dist
