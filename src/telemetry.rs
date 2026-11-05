@@ -21,6 +21,37 @@ impl Wire for RetentionOnly {
 mod tests {
     use super::*;
 
+    /// #55 A6/R1/R3: hostile foreign fields/identities cannot leak or discard valid neighbors; unknown lists are not zero.
+    #[test]
+    fn inventory_privacy_rejection_isolated_and_missing_collections_stay_unknown() {
+        let home = crate::tests::scratch("inventory-privacy");
+        let secret = "ghp_aaaaaaaaaaaaaaaaaaaaaaaa"; // Invented credential.
+        let mut entities = vec![json!({"entity": "host", "identity": "host", "status": "unknown"})];
+        for field in ["content", "file_content", "env", "environment", "credential", "token", "stdout", "command"] {
+            let mut row = json!({"entity": "folder", "identity": "/allowed", "disk_used_bytes": 1});
+            row[field] = secret.into();
+            entities.push(row);
+        }
+        entities.push(json!({"entity": "folder", "identity": "/bad\nidentity", "disk_used_bytes": 0}));
+        let sample = json!({"trace": "a".repeat(32), "at_ms": 1000, "duration_us": 10,
+            "entities": entities, "collections": {"services": {"status": "unknown", "reason": "access-denied", "count": null}},
+            "scan": {"status": "unknown", "reason": "not-configured", "duration_us": 1, "cpu_us": 0}});
+        let mut checks = Checks::default();
+        let result = checks.inventory(&home, &sample);
+        assert_eq!(result["status"], "unknown");
+        assert_eq!(result["rejected"], 9);
+        let data = checks.store(&home).unwrap().export(0, 0, 100).unwrap();
+        assert!(!data.to_string().contains(secret));
+        let observations: Vec<_> = data["events"].as_array().unwrap().iter().map(|e| &e["observation"]).collect();
+        assert_eq!(observations.iter().filter(|o| o["inventory"]["entity"] == "host").count(), 1);
+        let services = observations.iter().find(|o| o["operation"] == "inventory.services").unwrap();
+        assert!(services["units"].is_null());
+        assert_eq!(services["unknown"]["units"], "access-denied");
+        assert_eq!(services["outcome"], "failed");
+        drop(checks);
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
     /// A3/§ 9: reopening a cursorless store must protect unsent rows without delivering during a check.
     #[test]
     fn cursorless_restart_preserves_unshipped_records() {
@@ -131,6 +162,65 @@ impl Checks {
         let record = (|| { self.store(home)?.append(&[Event::observation(value)?])?; Ok::<_, String>(()) })();
         if let Err(e) = record {
             eprintln!("serverq: telemetry unknown: {e}");
+        }
+    }
+
+    /// § 11: fresh per-entity observations, retained in the existing cursor-protected store.
+    pub fn inventory(&mut self, home: &Path, sample: &Value) -> Value {
+        let mut rejected = 0;
+        let result = (|| {
+            let mut events = vec![];
+            let base = |operation: &str| json!({"product": "serverq", "version": crate::VERSION, "kind": "operation",
+                "operation": operation, "trace": sample["trace"], "span": null, "unknown": {"span": "no-caller"},
+                "started_ms": sample["at_ms"], "duration_us": sample["duration_us"],
+                "runtime": format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)});
+            for row in sample["entities"].as_array().ok_or("invalid-inventory")? {
+                let ok = row["unknown"].as_object().is_some_and(|r| r.is_empty()) && row["status"] != "unknown";
+                let mut event = base("inventory.sample");
+                event["kind"] = "inventory".into();
+                event["outcome"] = if ok { "ok" } else { "failed" }.into();
+                event["error"] = if ok { "none" } else { "collection-incomplete" }.into();
+                event["inventory"] = row.clone();
+                match Event::observation(event) { Ok(event) => events.push(event), Err(_) => rejected += 1 }
+            }
+            for (name, result) in sample["collections"].as_object().ok_or("invalid-inventory-collections")? {
+                let ok = result["status"] == "ok";
+                let mut event = base(&format!("inventory.{name}"));
+                event["outcome"] = if ok { "ok" } else { "failed" }.into();
+                event["error"] = if ok { "none" } else { result["reason"].as_str().unwrap_or("collection-failed") }.into();
+                event["units"] = result["count"].clone();
+                event["unit_kind"] = "entities".into();
+                if event["units"].is_null() { event["unknown"]["units"] = event["error"].clone(); }
+                events.push(Event::observation(event)?);
+            }
+            let scan = &sample["scan"];
+            let mut event = base("inventory.scan");
+            event["duration_us"] = scan["duration_us"].clone();
+            event["outcome"] = if scan["status"] == "ok" { "ok" } else { "failed" }.into();
+            event["error"] = scan["reason"].as_str().unwrap_or("none").into();
+            event["units"] = scan["cpu_us"].clone();
+            event["unit_kind"] = "cpu-us".into();
+            if event["units"].is_null() { event["unknown"]["units"] = "cpu-clock-unavailable".into(); }
+            events.push(Event::observation(event)?);
+            if rejected > 0 {
+                let mut event = base("inventory.capture");
+                event["outcome"] = "failed".into();
+                event["error"] = "invalid-identity".into();
+                event["units"] = rejected.into();
+                event["unit_kind"] = "rejected-entities".into();
+                events.push(Event::observation(event)?);
+            }
+            let count = events.len();
+            for batch in events.chunks(1024) { self.store(home)?.append(batch)?; }
+            Ok::<_, String>(count)
+        })();
+        match result {
+            Ok(count) if rejected == 0 => json!({"status": "ok", "records": count}),
+            Ok(count) => {
+                eprintln!("serverq: telemetry unknown: invalid inventory identities: {rejected}");
+                json!({"status": "unknown", "reason": "invalid-identity", "records": count, "rejected": rejected})
+            }
+            Err(e) => { eprintln!("serverq: telemetry unknown: {e}"); json!({"status": "unknown", "reason": "store-failed"}) }
         }
     }
 

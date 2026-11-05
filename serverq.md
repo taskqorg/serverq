@@ -1,21 +1,22 @@
 # serverq contract
 
-serverq checks a Linux server against the agreed server-care rules and reports deviations to agents and monitors. It never repairs a server, takes commands or promises uptime (R2, R3, R8).
+serverq checks server-care rules and reports read-only host, workload and disk inventory to agents and monitors. It never repairs a server, takes commands, runs AI or promises uptime (R2, R3, R8).
 
-This file is the whole contract of **v1**, the Rust binary built on [coreq](https://github.com/taskqorg/coreq). It follows the [specq release contract](https://github.com/taskqorg/specq/blob/main/engineering/release-contract.md); coreq.md holds the shared update, launcher, service and `status.json` detail. The runtime uses coreq v0.20.0, pinned to commit `a6096f7ac1710d9e4735b3763ca3a42a853912e1`.
+This file is the whole contract of **v1**, the Rust binary built on [coreq](https://github.com/taskqorg/coreq). It follows the [specq release contract](https://github.com/taskqorg/specq/blob/main/engineering/release-contract.md); coreq.md holds the shared update, launcher, service and `status.json` detail.
+The runtime uses coreq v0.22.0, pinned to commit `c02513fd4b7d296c075a91b08c2e9ad16b0726aa`.
 
 ## 1. Principles
 
 - **R1 Unknown is never healthy.** [specq verification](https://github.com/taskqorg/specq/blob/main/engineering/verification.md) binds serverq: unknown is never healthy (here the status `unknown`), and remediation is scoped and separate.
-- **R2 Read-only.** serverq writes only its own install folder. It never changes server settings, deletes operator data, resets failures, restarts other services, runs AI or applies recommendations. Remediation is a separate action by an agent or operator.
-- **R3 No command channel.** Independent enrollment adds explicitly approved observation delivery through coreq (§ 5); primary checks and recommendations remain read-only. No AgentQ/Langfuse dependency: DashQ can neither rerun nor repair a check.
+- **R2 Read-only.** Checks and inventory write only serverq's install folder. They never change server settings, delete operator data, reset failures, restart other services, run AI or apply recommendations. Server changes go through ordinary TaskQ tasks with their own authorization.
+- **R3 No command channel.** Independent enrollment adds approved observation delivery through coreq (§ 5), including typed inventory (§ 11). Checks and inventory remain read-only. No AgentQ/Langfuse dependency: DashQ can neither rerun nor repair a check, scan or workload.
 - **R4 One catalog.** `rules.json` at the repository root is the only recommendation catalog. The binary embeds its exact bytes at build time; no other file, doc or agent copies its thresholds.
 - **R5 Manual rules stay manual.** A rule with `manual: true` is listed, never claimed as automatically verified. Exit 0 never certifies manual rules.
 - **R6 Dynamic checks every time.** Capacity and service checks run on every pass. Only configuration checks are cached (§ 3).
 - **R7 Compatible reports.** Exit codes and the report schema are those of the Python serverq; a monitor reading either keeps working. A release changes `report.json` and `state.json` only additively (N/N-1); a new schema number needs a cutover task.
-- **R8 Scope.** serverq promises no uptime, security compliance, backup restoration or application monitoring. It adds no unattended git pull, generic cleanup, self-improvement loop or remote execution.
+- **R8 Scope.** Read-only status, resources, services, containers, project roots and disk use are in scope. AI analysis belongs to consumers. serverq promises no uptime, security compliance, backup restoration or application monitoring, and adds no unattended git pull, cleanup, self-improvement loop or remote execution.
 - **R9 Canonical server-care principles.** A server maintenance task that establishes a reusable principle adds or refines it in `rules.json` with evidence, a verification method and tests. Machine-specific inventory stays private, outside this repository.
-- **R10 Spec first.** A change that alters a decision edits this file, or the linked detail that holds it (§ 11), first, in the same deliverable as the code.
+- **R10 Spec first.** A change that alters a decision edits this file, or the linked detail that holds it (§ 12), first, in the same deliverable as the code.
 
 ## 2. Commands
 
@@ -61,6 +62,7 @@ Checks, in the order of `rules.json`:
 - `revision` = sha256 of the embedded `rules.json` bytes plus the binary version.
 - Incidents per rule: a `warn` opens or continues `{first_seen, last_seen, occurrences, state: observed}`; a later `ok` sets `state: verified, verified_at`. They survive restarts.
 - `report.json` schema 1: `schema`, `at` (Unix seconds), `revision`, `catalog` (sha256 of the embedded `rules.json` bytes; additive), `filesystem`, `results`, `incidents`, `manual_rules`.
+- Additive `inventory` holds the latest sample (§ 11); inventory completeness never changes the existing rule exit codes.
 - Each result: `status` `ok|warn|unknown`, `detail`, probe fields, `cached`, `checked_at` for cached rules, and `reason` on every non-`ok` result (additive).
 - `reason` vocabulary: `unsupported-os`, `collection-failed`, `capacity-unavailable`, `below-minimum`, `failed-units`, `missing-journal-bounds`, `docker-cli-missing`, `unsupported-log-driver`, `missing-rotation`.
 - Files are written atomically (temp file, fsync, rename, directory fsync), mode 0600, in a 0700 folder.
@@ -159,7 +161,7 @@ LaunchAgent detail and qualification: [platforms](docs/design/platforms.md).
 serverq follows [specq built-in profiling](https://github.com/taskqorg/specq/blob/main/engineering/profiling.md). Operations, budgets, the `profile.json` store and the report: [profiling detail](docs/design/profiling.md).
 
 - **No silent zero (R1).** An operation without samples reads `unknown` with `reason: no-samples`, a malformed record with `reason: corrupt-record`; neither reads as zero.
-- **No private data.** No message text, path, unit name or container ID is stored.
+- **Metadata only.** No message text, file content, environment value or credential is stored. Typed inventory identities are the sole exception to the check observations' ban on paths, unit names and container IDs (§ 11).
 - Counters are always on; traces are off until `<install>/trace` exists. serverq never retries, so no operation counts as retried.
 - **Check observations (R1, R3).** Each automated rule evaluation in § 3, including cached and unsupported results, writes one CoreQ `kind: check` observation with the rule ID as `operation`, UTC start, monotonic duration, outcome, error class and host.
   CLI checks, install checks, selftest and service checks use this same path; manual rules emit none. `ok` maps to outcome `ok`, error `none`; `warn` and `unknown` map to `failed`, with the result's stable `reason` as the error class.
@@ -175,7 +177,21 @@ serverq follows [specq built-in profiling](https://github.com/taskqorg/specq/blo
 - They cover install preparation failure without service effects, update then rollback of an enrolled install against a fake release served by a fake `curl`, `doctor` against tool fakes at, below and missing each minimum, and human-time boundaries.
 - Linux-only service tests compile only on Linux; on other OSes the CLI test asserts `unsupported-os`. CI runs the tests on Linux, Windows and macOS aarch64; the Scheduled Task is verified on the authorized Windows host.
 
-## 11. Linked detail
+## 11. Inventory
+
+- Every completed audit collects one timestamped inventory sample. Its host status is the rule aggregate `ok|warn|unknown`, never a promise of uptime. An unsupported, unavailable or partial measurement is null with a stable reason (R1); a missing list is unknown, never an empty healthy list.
+- Host fields: OS and version, uptime, 1/5/15-minute load, logical CPU count and usage, total/used RAM and swap. Windows swap is unknown `unsupported-os`: commit accounting is not pagefile usage. Mounts report total, used and available bytes. CPU usage is thousandths of a logical CPU; system and process usage use two refreshes at least the platform's minimum interval apart.
+- Loaded systemd services, Windows services and this user's LaunchAgents carry status, CPU, RAM and disk usage. Linux uses systemd accounting; Windows uses process-tree CPU/RAM and shared PIDs stay unknown; macOS measures each LaunchAgent PID. Service disk is unknown without ownership proof. Container disk means its writable layer, excluding shared images and bind mounts.
+- `<install>/inventory.json` is an optional local array of absolute project-root paths, never committed here. Those exact trees define project inventory and folder scan scope; no configuration means unknown `not-configured`. Invalid configuration is preserved and reported unknown. Projects sum processes whose working directory is inside that root; missing attribution stays unknown.
+- The scan runs in a dedicated background-priority thread and reads only directory entries and metadata: no file contents, links/reparse targets or other filesystems. Directory capabilities open each component without following links. It reports the 100 largest folders through depth 4, using allocated bytes on Unix and logical bytes on Windows; hard links count once per tree.
+- A scan visits at most 100,000 entries through traversal depth 128 and takes at most 15 seconds between metadata calls. Truncation or denied access makes affected totals unknown. The report includes scope, bounds, duration, CPU time and priority outcome; telemetry records scan CPU usage without a hard CPU ceiling.
+- Linux, Windows and macOS collect native resources; unsupported fields stay unknown with reasons. macOS project CPU/RAM attribution is unsupported; it never uses Sysinfo's process reader, which reads arguments and environments. Collection never requests elevation or TCC grants, reads arguments or environments, or inspects project contents.
+- Each entity becomes a CoreQ `kind: inventory` observation with one sample trace and its observation time. Only CoreQ R54's typed host, mount, service, container, project-root and folder identity and measurement fields leave the host; raw reports, command output and configuration never do. The check projection allowlist (§ 3) stays unchanged.
+- Collection observations carry list counts or null with their reason; the scan operation carries CPU microseconds and wall duration. An invalid entity is rejected independently and counted as loss; valid neighboring entities survive. Store failures and invalid identities are visible in the report's inventory telemetry status.
+- The existing CoreQ store and shipper (§ 9) retain successive samples under CoreQ's 30-day and physical-cap retention. Unsent samples are cursor-protected, never coalesced like snapshots. Store-full or rejected samples are reported unknown/loss; consumers compute growth only from two known measurements of the same identity and different observation times.
+- Receiver compatibility requires DashQ's typed inventory allowlist at `f9961e306dc2ecb63dbf8185e42464d24a45122d` or a descendant. This is code compatibility, not proof of production rollout.
+
+## 12. Linked detail
 
 Binding detail, loaded on demand:
 

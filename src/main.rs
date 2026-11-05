@@ -10,6 +10,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod profile;
+mod inventory;
 mod telemetry;
 mod time;
 
@@ -816,7 +817,10 @@ fn audit(home: &Path, filesystem: &str, force: bool, telemetry: &mut telemetry::
     }
     incidents(&mut state, &results, now)?;
     let manual: Vec<&String> = rules.iter().filter(|(_, r)| r["manual"] == true).map(|(k, _)| k).collect();
-    let report = json!({"schema": 1, "at": now, "revision": revision, "catalog": sha256(RULES), "filesystem": filesystem, "results": results,
+    let status = if results.values().any(|r| r["status"] == "unknown") { "unknown" } else if results.values().any(|r| r["status"] == "warn") { "warn" } else { "ok" };
+    let mut inventory = inventory::collect(home, status);
+    inventory["telemetry"] = telemetry.inventory(home, &inventory);
+    let report = json!({"schema": 1, "at": now, "revision": revision, "catalog": sha256(RULES), "filesystem": filesystem, "results": results, "inventory": inventory,
         "incidents": state.get("incidents").cloned().unwrap_or(json!({})), "manual_rules": manual});
     state.insert("revision".into(), revision.into());
     state.insert("last_run".into(), now.into());
@@ -1644,7 +1648,7 @@ mod tests {
         assert!(telemetry.ship(&home, &mut backoff, &mut dash).is_some());
         dash.online = true;
         assert_eq!(telemetry.ship(&home, &mut backoff, &mut dash), None);
-        let observations: Vec<_> = dash.events.iter().filter(|e| e.2["schema"] == coreq::telemetry::OBSERVATION_SCHEMA).collect();
+        let observations: Vec<_> = dash.events.iter().filter(|e| e.2["schema"] == coreq::telemetry::OBSERVATION_SCHEMA && e.2["payload"]["observation"]["kind"] == "check").collect();
         assert_eq!(observations.len(), report["results"].as_object().unwrap().len());
         for (_, _, r) in observations {
             let o = &r["payload"]["observation"];
