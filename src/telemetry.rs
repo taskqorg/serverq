@@ -8,9 +8,57 @@ pub struct Checks {
     store: Option<Store>,
 }
 
+// CoreQ exposes cursor initialization through ship; recording must never send a backlog inline.
+struct RetentionOnly;
+impl Wire for RetentionOnly {
+    fn post(&mut self, _: &str, _: &str, _: Option<&str>, _: &Value) -> Result<(u16, Value), String> { Err("retention-only".into()) }
+    fn now(&self) -> u64 { 0 }
+    fn sleep(&mut self, _: u64) {}
+    fn show(&mut self, _: &str, _: &str) {}
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A3/§ 9: reopening a cursorless store must protect unsent rows without delivering during a check.
+    #[test]
+    fn cursorless_restart_preserves_unshipped_records() {
+        let home = crate::tests::scratch("telemetry-cursorless-restart");
+        let event = || Event::observation(json!({"product": "serverq", "version": crate::VERSION,
+            "kind": "check", "operation": "disk-headroom", "started_ms": 0,
+            "trace": null, "span": null, "unknown": {"trace": "no-caller", "span": "no-caller"},
+            "outcome": "failed", "error": "collection-failed"})).unwrap();
+        // A crash after opening the database can leave either an empty store or an unsent backlog.
+        for backlog in [0, 1] {
+            let path = home.join(format!("backlog-{backlog}"));
+            std::fs::create_dir(&path).unwrap();
+            let store = Store::open(&path.join("telemetry.db")).unwrap();
+            if backlog > 0 { store.append(&[event()]).unwrap(); }
+            assert_eq!(store.shipper().unwrap()["state"], "off");
+            drop(store);
+            // Invented approved grant: initializing retention must not deliver its backlog.
+            let connection = path.join("connection");
+            std::fs::create_dir(&connection).unwrap();
+            std::fs::write(connection.join("connection.json"), json!({"active": {
+                "destination": "https://dash.example", "credential": "invented", "generation": 1,
+                "schemas": [coreq::telemetry::OBSERVATION_SCHEMA]}}).to_string()).unwrap();
+            let mut checks = Checks::default();
+            let store = checks.store(&path).unwrap();
+            // Historical receipt clocks exercise age pruning deterministically, without sleeps or SQL edits.
+            store.import_history("fixture", None, "old", &(0..5).map(|_| event()).collect::<Vec<_>>(), &[0; 5]).unwrap();
+            store.prune().unwrap();
+            assert_eq!(store.export(0, 0, 10).unwrap()["events"].as_array().unwrap().len(), backlog + 5,
+                "restart must preserve every unshipped observation through age pruning");
+            assert_eq!(store.storage().unwrap()["pruned_count"], 0);
+            assert_eq!(store.shipper().unwrap()["cursor"], 0, "initialization never acknowledges delivery");
+            drop(checks);
+            let mut checks = Checks::default();
+            checks.record(&path, "disk-headroom", (SystemTime::now(), Duration::ZERO), &json!({"status": "unknown", "reason": "collection-failed"}));
+            assert_eq!(checks.store(&path).unwrap().shipper().unwrap()["backlog_rows"], backlog + 6);
+        }
+        std::fs::remove_dir_all(home).unwrap();
+    }
 
     /// § 9/R1: stored observations distinguish deviations, cached results and failed collection.
     #[test]
@@ -50,12 +98,12 @@ impl Checks {
     fn store(&mut self, home: &Path) -> Result<&Store, String> {
         if self.store.is_none() {
             let path = home.join("telemetry.db");
-            let fresh = !path.exists();
             let store = Store::open(&path)?;
-            if fresh {
-                // An empty pass activates cursor-safe retention before the first append, without network I/O.
-                store.ship(&home.join("connection"), &mut Backoff::default(), &mut coreq::enroll::Https { browser: false })
-                    .map_err(|e| format!("shipper initialization failed: {e:?}"))?;
+            if store.shipper()?["cursor"].is_null() {
+                let initialized = store.ship(&home.join("connection"), &mut Backoff::default(), &mut RetentionOnly);
+                if store.shipper()?["cursor"].is_null() {
+                    return Err(format!("shipper initialization failed: {initialized:?}"));
+                }
             }
             self.store = Some(store);
         }
