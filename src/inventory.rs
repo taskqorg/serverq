@@ -264,9 +264,16 @@ fn workload(row: &mut Value, system: &System, usage: &HashMap<sysinfo::Pid, u64>
     if let Some(ram) = ram { put(row, "ram_used_bytes", ram); }
 }
 
+fn probe(argv: &[&str]) -> Result<String, &'static str> {
+    crate::run_probe(argv).map_err(|error| {
+        eprintln!("serverq: inventory unknown: {error}");
+        "collection-failed"
+    })
+}
+
 fn services() -> Result<Vec<Value>, &'static str> {
     if cfg!(target_os = "linux") {
-        let output = crate::run_probe(&["systemctl", "show", "--all", "--no-pager", "--property=Id,ActiveState,CPUUsageNSec,MemoryCurrent", "*.service"]).map_err(|_| "collection-failed")?;
+        let output = probe(&["systemctl", "show", "--all", "--no-pager", "--property=Id,ActiveState,CPUUsageNSec,MemoryCurrent", "*.service"])?;
         let mut rows = vec![];
         for block in output.split("\n\n") {
             let mut row = json!({});
@@ -288,7 +295,7 @@ fn services() -> Result<Vec<Value>, &'static str> {
     } else if cfg!(windows) {
         windows_services()
     } else if cfg!(target_os = "macos") {
-        let output = crate::run_probe(&["launchctl", "list"]).map_err(|_| "collection-failed")?;
+        let output = probe(&["launchctl", "list"])?;
         let mut rows = vec![];
         for line in output.lines().skip(1) {
             let fields: Vec<_> = line.split_whitespace().collect();
@@ -309,7 +316,7 @@ fn containers() -> Result<Vec<Value>, &'static str> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
         Err(e) => return Err(io_reason(e)),
     }
-    let ids = crate::run_probe(&["docker", "--host", "unix:///var/run/docker.sock", "container", "ls", "--all", "--quiet", "--no-trunc"]).map_err(|_| "collection-failed")?;
+    let ids = probe(&["docker", "--host", "unix:///var/run/docker.sock", "container", "ls", "--all", "--quiet", "--no-trunc"])?;
     let ids: Vec<_> = ids.split_whitespace().collect();
     if ids.iter().any(|id| id.len() != 64 || !id.bytes().all(|b| b.is_ascii_hexdigit())) { return Err("collection-failed"); }
     let mut result = vec![];
@@ -317,7 +324,7 @@ fn containers() -> Result<Vec<Value>, &'static str> {
         let mut argv = vec!["docker", "--host", "unix:///var/run/docker.sock", "container", "inspect", "--size", "--format",
             r#"{"identity":{{json .Name}},"status":{{json .State.Status}},"disk_used_bytes":{{json .SizeRw}},"pid":{{json .State.Pid}}}"#];
         argv.extend_from_slice(batch);
-        let output = crate::run_probe(&argv).map_err(|_| "collection-failed")?;
+        let output = probe(&argv)?;
         for line in output.lines() { result.push(serde_json::from_str(line).map_err(|_| "collection-failed")?); }
     }
     Ok(result)
@@ -572,25 +579,9 @@ fn memory_validity(host: &mut Value) {
 }
 #[cfg(windows)]
 fn memory_validity(host: &mut Value) {
-    #[repr(C)]
-    struct Performance { cb: u32, commit_total: usize, commit_limit: usize, commit_peak: usize, physical_total: usize,
-        physical_available: usize, system_cache: usize, kernel_total: usize, kernel_paged: usize, kernel_nonpaged: usize,
-        page_size: usize, handles: u32, processes: u32, threads: u32 }
-    #[link(name = "kernel32")]
-    unsafe extern "system" { fn K32GetPerformanceInfo(info: *mut Performance, size: u32) -> i32; }
-    let mut perf: Performance = unsafe { std::mem::zeroed() };
-    perf.cb = std::mem::size_of::<Performance>() as u32;
-    let quantities = if unsafe { K32GetPerformanceInfo(&mut perf, perf.cb) } != 0 {
-        (perf.page_size as u64).checked_mul(perf.commit_limit.saturating_sub(perf.physical_total) as u64)
-            .zip((perf.page_size as u64).checked_mul(perf.commit_total.saturating_sub(perf.physical_total) as u64))
-    } else { None };
-    if let Some((total, used)) = quantities {
-        put(host, "swap_total_bytes", total);
-        put(host, "swap_used_bytes", used);
-    } else {
-        missing(host, "swap_total_bytes", "collection-failed");
-        missing(host, "swap_used_bytes", "collection-failed");
-    }
+    // shortcut: Windows swap unavailable; add a pagefile probe when supported.
+    missing(host, "swap_total_bytes", "unsupported-os");
+    missing(host, "swap_used_bytes", "unsupported-os");
 }
 #[cfg(target_os = "macos")]
 fn memory_validity(host: &mut Value) {

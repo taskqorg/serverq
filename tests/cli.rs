@@ -45,6 +45,13 @@ fn inventory_samples_survive_restart_and_ship_without_file_or_environment_conten
         assert_eq!(host[field].is_null(), host["unknown"].get(field).is_some(), "R1: {field} has a reason iff unavailable");
     }
     if cfg!(windows) { assert_eq!(host["unknown"]["load_1_milli"], "unsupported-os"); }
+    // R1/A7: Windows commit accounting is not a measurement of pagefile usage.
+    if cfg!(windows) {
+        for field in ["swap_total_bytes", "swap_used_bytes"] {
+            assert!(host[field].is_null());
+            assert_eq!(host["unknown"][field], "unsupported-os");
+        }
+    }
     fs::write(root.join("large/growth.bin"), vec![0; 16384]).unwrap();
     std::thread::sleep(std::time::Duration::from_millis(2));
     let second = report(&run());
@@ -83,6 +90,39 @@ fn inventory_samples_survive_restart_and_ship_without_file_or_environment_conten
     assert!(projects[1]["inventory"]["disk_used_bytes"].as_u64() > projects[0]["inventory"]["disk_used_bytes"].as_u64());
     assert_ne!(projects[0]["started_ms"], projects[1]["started_ms"]);
     assert_eq!(projects[0]["trace"], first["inventory"]["trace"]);
+    drop(store);
+    fs::remove_dir_all(home).unwrap();
+}
+
+/// R1/R3/§ 6: command failures name their local cause without exporting raw diagnostics.
+#[cfg(unix)]
+#[test]
+fn inventory_probe_failure_keeps_local_cause_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = scratch("inventory-probe");
+    let bin = home.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let tool = if cfg!(target_os = "macos") { "launchctl" } else { "systemctl" };
+    let path = bin.join(tool);
+    fs::write(&path, "#!/bin/sh\necho invented-private-probe-error >&2\nexit 5\n").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_serverq")).args(["check", "--home"]).arg(&home)
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display())).output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let command = if cfg!(target_os = "macos") { "launchctl list" } else { "systemctl show" };
+    assert!(stderr.lines().any(|l| l.starts_with("serverq: inventory unknown:")
+        && l.contains(command) && l.contains("exit 5: invented-private-probe-error")), "{stderr}");
+    let sample = report(&output);
+    assert_eq!(sample["inventory"]["collections"]["services"]["status"], "unknown");
+    assert_eq!(sample["inventory"]["collections"]["services"]["reason"], "collection-failed");
+    assert!(sample["inventory"]["collections"]["services"]["count"].is_null());
+    let store = coreq::telemetry::Store::open(&home.join("telemetry.db")).unwrap();
+    let records = store.export(0, 0, 1024).unwrap();
+    assert!(!records.to_string().contains("invented-private-probe-error"));
+    let services = records["events"].as_array().unwrap().iter().map(|e| &e["observation"])
+        .find(|o| o["operation"] == "inventory.services").unwrap();
+    assert_eq!(services["error"], "collection-failed");
+    assert!(services["units"].is_null());
     drop(store);
     fs::remove_dir_all(home).unwrap();
 }
@@ -633,6 +673,7 @@ fn macos_service_lifecycle() {
     fs::create_dir(&bin).unwrap();
     let ctl = bin.join("launchctl");
     fs::write(&ctl, r#"#!/bin/sh
+[ "$1" != list ] || { printf 'PID\tStatus\tLabel\n'; exit 0; }
 printf '%s\n' "$*" >> "$HOME/calls"
 [ -z "$FAIL_LAUNCHCTL" ] || exit 5
 case "$1" in
