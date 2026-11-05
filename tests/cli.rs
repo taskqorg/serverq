@@ -22,6 +22,71 @@ fn report(o: &Output) -> Value {
     serde_json::from_slice(&o.stdout).unwrap()
 }
 
+/// #55 A2–A7/R1/R3: successive metadata samples reach the existing shipper without coalescing or secret content.
+#[test]
+fn inventory_samples_survive_restart_and_ship_without_file_or_environment_contents() {
+    let home = fs::canonicalize(scratch("inventory")).unwrap();
+    let root = home.join("project");
+    fs::create_dir_all(root.join("large")).unwrap();
+    let sentinel = "invented-file-content-ghp_aaaaaaaaaaaaaaaaaaaaaaaa";
+    fs::write(root.join("large/private.txt"), sentinel).unwrap();
+    fs::write(home.join("inventory.json"), serde_json::json!([root]).to_string()).unwrap();
+    let run = || Command::new(env!("CARGO_BIN_EXE_serverq")).args(["check", "--home"]).arg(&home)
+        .env("SERVERQ_INVENTED_SECRET", "invented-environment-value").output().unwrap();
+    let first = report(&run());
+    assert!(first["inventory"]["entities"].as_array().is_some(), "A2: the report must carry an inventory sample");
+    let host = &first["inventory"]["entities"][0];
+    assert_eq!(host["entity"], "host");
+    assert_eq!(host["os"], std::env::consts::OS);
+    let statuses: Vec<_> = first["results"].as_object().unwrap().values().map(|r| r["status"].as_str().unwrap()).collect();
+    assert_eq!(host["status"], if statuses.contains(&"unknown") { "unknown" } else if statuses.contains(&"warn") { "warn" } else { "ok" });
+    for field in ["os_version", "uptime_s", "cpu_count", "cpu_used_milli", "ram_total_bytes", "ram_used_bytes", "swap_total_bytes", "swap_used_bytes", "load_1_milli", "load_5_milli", "load_15_milli"] {
+        assert!(host.get(field).is_some(), "A2: {field} is present");
+        assert_eq!(host[field].is_null(), host["unknown"].get(field).is_some(), "R1: {field} has a reason iff unavailable");
+    }
+    if cfg!(windows) { assert_eq!(host["unknown"]["load_1_milli"], "unsupported-os"); }
+    fs::write(root.join("large/growth.bin"), vec![0; 16384]).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    let second = report(&run());
+    let project_size = |r: &Value| r["inventory"]["entities"].as_array().unwrap().iter()
+        .find(|r| r["entity"] == "project_root").unwrap()["disk_used_bytes"].as_u64().unwrap();
+    assert!(project_size(&second) > project_size(&first));
+    assert_ne!(first["inventory"]["trace"], second["inventory"]["trace"]);
+    assert!(second["inventory"]["at_ms"].as_u64() > first["inventory"]["at_ms"].as_u64());
+    let store = coreq::telemetry::Store::open(&home.join("telemetry.db")).unwrap();
+    let connection = home.join("connection");
+    fs::create_dir_all(&connection).unwrap();
+    fs::write(connection.join("connection.json"), serde_json::json!({"installation": "invented", "active": {
+        "destination": "https://dash.example", "credential": "invented", "generation": 1}}).to_string()).unwrap();
+    struct Receiver(Vec<Value>);
+    impl coreq::enroll::Wire for Receiver {
+        fn post(&mut self, _: &str, _: &str, _: Option<&str>, body: &Value) -> Result<(u16, Value), String> {
+            let records = body["records"].as_array().unwrap();
+            self.0.extend(records.iter().cloned());
+            Ok((200, serde_json::json!({"protocol": 1, "receipts": records.iter().map(|r|
+                serde_json::json!({"event_id": r["event_id"], "state": "accepted"})).collect::<Vec<_>>()})))
+        }
+        fn now(&self) -> u64 { 0 }
+        fn sleep(&mut self, _: u64) {}
+        fn show(&mut self, _: &str, _: &str) {}
+    }
+    let mut receiver = Receiver(vec![]);
+    let mut backoff = coreq::enroll::Backoff::default();
+    while store.ship(&connection, &mut backoff, &mut receiver).unwrap().more {}
+    let wire = serde_json::to_string(&receiver.0).unwrap();
+    for private in [sentinel, "invented-environment-value", "private.txt", "growth.bin"] {
+        assert!(!wire.contains(private), "A6: {private} must stay on the host");
+    }
+    let projects: Vec<_> = receiver.0.iter().map(|r| &r["payload"]["observation"])
+        .filter(|o| o["inventory"]["entity"] == "project_root").collect();
+    assert_eq!(projects.len(), 2, "A5: both samples survive process restart and ship");
+    assert!(projects[1]["inventory"]["disk_used_bytes"].as_u64() > projects[0]["inventory"]["disk_used_bytes"].as_u64());
+    assert_ne!(projects[0]["started_ms"], projects[1]["started_ms"]);
+    assert_eq!(projects[0]["trace"], first["inventory"]["trace"]);
+    drop(store);
+    fs::remove_dir_all(home).unwrap();
+}
+
 /// A2/A3, R1 and § 9: a collection failure must survive the binary/store/shipper/D11 boundary as failed.
 #[test]
 fn check_observations_reach_dashq_as_failed() {
@@ -55,9 +120,11 @@ fn check_observations_reach_dashq_as_failed() {
         "destination": "https://dash.example", "credential": "invented", "generation": 1}}).to_string()).unwrap();
     let mut dash = Dash::default();
     let shipped = store.ship(&connection, &mut Backoff::default(), &mut dash).unwrap();
-    assert_eq!(shipped.sent, RESULTS.len());
-    assert_eq!(dash.0.iter().map(|r| r["payload"]["observation"]["operation"].as_str().unwrap()).collect::<BTreeSet<_>>(), RESULTS.into());
-    for record in &dash.0 {
+    let checks: Vec<_> = dash.0.iter().filter(|r| r["payload"]["observation"]["kind"] == "check").collect();
+    assert!(shipped.sent >= RESULTS.len());
+    assert_eq!(checks.len(), RESULTS.len(), "inventory does not replace any rule observation");
+    assert_eq!(checks.iter().map(|r| r["payload"]["observation"]["operation"].as_str().unwrap()).collect::<BTreeSet<_>>(), RESULTS.into());
+    for record in checks {
         assert_eq!(record["schema"], "coreq-observation/1");
         let o = &record["payload"]["observation"];
         assert_eq!(o["kind"], "check");
