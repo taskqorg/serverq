@@ -10,6 +10,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod profile;
+mod telemetry;
 mod time;
 
 const RULES: &[u8] = include_bytes!("../rules.json");
@@ -21,7 +22,7 @@ const LINUX: bool = cfg!(target_os = "linux");
 const UNSUPPORTED: &str = "unsupported-os";
 /// coreq's Windows unit for project `serverq`: `<title>-<project>`.
 const TASK: &str = "ServerQ-serverq";
-/// The one schema a ServerQ grant covers (coreq-enrollment/1, DashQ C3).
+/// Report schema; enrollment also requests CoreQ observations (serverq.md § 9).
 const SCHEMA: &str = "serverq-report/1";
 /// Fixed `reason` vocabulary of non-`ok` results; the projection exports nothing else (serverq.md § 3, § 5).
 const REASONS: [&str; 9] = [UNSUPPORTED, COLLECTION, "capacity-unavailable", "below-minimum", "failed-units", "missing-journal-bounds", "docker-cli-missing", "unsupported-log-driver", "missing-rotation"];
@@ -114,7 +115,7 @@ fn run(args: &[String]) -> Result<i32, String> {
 fn dispatch(t: &coreq::Tool, words: &[&str], filesystem: &str, force: bool, headless: bool) -> Result<i32, String> {
     match words {
         ["check"] => {
-            let (code, report) = check(&t.install, filesystem, force)?;
+            let (code, report) = check(&t.install, filesystem, force, &mut telemetry::Checks::default())?;
             println!("{}", pretty(&report));
             Ok(code)
         }
@@ -154,9 +155,9 @@ fn dispatch(t: &coreq::Tool, words: &[&str], filesystem: &str, force: bool, head
 }
 
 /// One locked audit; exit 0 all `ok`, 1 a `warn`, 2 any `unknown`.
-fn check(home: &Path, filesystem: &str, force: bool) -> Result<(i32, Value), String> {
+fn check(home: &Path, filesystem: &str, force: bool, telemetry: &mut telemetry::Checks) -> Result<(i32, Value), String> {
     let _lock = lock(home, "check")?;
-    let report = audit(home, filesystem, force)?;
+    let report = audit(home, filesystem, force, telemetry)?;
     let statuses: Vec<&str> = report["results"].as_object().into_iter().flatten().map(|(_, r)| r["status"].as_str().unwrap_or("unknown")).collect();
     Ok((if statuses.contains(&"unknown") { 2 } else if statuses.contains(&"warn") { 1 } else { 0 }, report))
 }
@@ -168,7 +169,7 @@ fn selftest() -> Result<i32, String> {
     let dir = std::env::temp_dir().join(format!("serverq-selftest-{}-{nanos}", std::process::id()));
     // a fresh 0700 folder: an existing path or a planted link fails instead of being written through
     fs::DirBuilder::new().mode(0o700).create(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let result = check(&dir, "/", true);
+    let result = check(&dir, "/", true, &mut telemetry::Checks::default());
     let _ = fs::remove_dir_all(&dir);
     let (code, report) = result?;
     let missing: Vec<&String> = rules.iter().filter(|(k, r)| r["manual"] != true && report["results"].get(k.as_str()).is_none()).map(|(k, _)| k).collect();
@@ -422,7 +423,7 @@ fn install(t: &coreq::Tool) -> Result<i32, String> {
     coreq::service::run_all(&u.load, false)?;
     println!("installed serverq {VERSION}; started {}", u.path.display());
     drop(held);
-    let (code, _) = check(&t.install, "/", false)?;
+    let (code, _) = check(&t.install, "/", false, &mut telemetry::Checks::default())?;
     println!("check exit {code}, report {}", t.install.join("report.json").display());
     print_unmet();
     Ok(0)
@@ -446,6 +447,9 @@ fn serve(t: &coreq::Tool) -> Result<i32, String> {
     let host = hostname();
     let mut backoff = coreq::enroll::Backoff::default();
     let mut next_send = None;
+    let mut telemetry = telemetry::Checks::default();
+    let mut telemetry_backoff = coreq::enroll::Backoff::default();
+    let mut next_telemetry = None;
     let (mut check_status, mut update_at, mut check_error, mut update_error): (Value, Value, Option<String>, Option<String>) = (Value::Null, Value::Null, None, None);
     let mut need_error = None;
     // the launcher runs `releases/<ver>/serverq`; a first completed check marks that release healthy
@@ -453,15 +457,16 @@ fn serve(t: &coreq::Tool) -> Result<i32, String> {
     println!("serverq {VERSION}: service started");
     loop {
         let next = next_check.min(next_update);
-        std::thread::sleep(next_send.filter(|s| *s < next).unwrap_or(next).saturating_duration_since(Instant::now()));
+        let wake = [Some(next), next_send, next_telemetry].into_iter().flatten().min().unwrap();
+        std::thread::sleep(wake.saturating_duration_since(Instant::now()));
         let paused = t.install.join("paused").exists();
         let mut checked = false;
         // a delivery retry wakes the loop before the next check or update without running either
-        let retry = next_send.is_some_and(|s| s < next);
+        let retry = wake < next;
         if !retry && Instant::now() >= next_check {
             next_check += check_every;
             let start = Instant::now();
-            let result = check(&t.install, "/", false);
+            let result = check(&t.install, "/", false, &mut telemetry);
             let error = match &result {
                 Err(e) => Some(profile::class(e)),
                 Ok((2, _)) => Some("unknown-result"),
@@ -523,7 +528,12 @@ fn serve(t: &coreq::Tool) -> Result<i32, String> {
         }
         profile::flush(&t.install);
         // the connection never changes a check result or the schedule; its outcome is one journal line
-        next_send = connection_pass(&t.install, checked, &mut backoff, &mut coreq::enroll::Https { browser: false }).map(|s| Instant::now() + Duration::from_secs(s));
+        if checked || next_send.is_none_or(|at| Instant::now() >= at) {
+            next_send = connection_pass(&t.install, checked, &mut backoff, &mut coreq::enroll::Https { browser: false }).map(|s| Instant::now() + Duration::from_secs(s));
+        }
+        if next_telemetry.is_none_or(|at| Instant::now() >= at) {
+            next_telemetry = telemetry.ship(&t.install, &mut telemetry_backoff, &mut coreq::enroll::Https { browser: false }).map(|s| Instant::now() + Duration::from_secs(s));
+        }
         let error = [&check_error, &update_error, &need_error].into_iter().flatten().cloned().collect::<Vec<_>>();
         let mut s = coreq::status::common(t, &host, "serverq", now() as u64, (!error.is_empty()).then(|| error.join("; ")), None);
         s["check"] = check_status.clone();
@@ -554,7 +564,7 @@ fn enroll(home: &Path, url: &str, wire: &mut dyn coreq::enroll::Wire) -> Result<
     let _lock = lock(&dir, "enroll")?;
     let id = installation(home)?;
     let label: String = hostname().chars().filter(|c| c.is_ascii_alphanumeric() || "._-".contains(*c)).take(64).collect();
-    let req = coreq::enroll::Request { product: "serverq", host_label: if label.is_empty() { "host" } else { &label }, schemas: &[SCHEMA], installation: Some(&id), scope: None, capabilities: &[] };
+    let req = coreq::enroll::Request { product: "serverq", host_label: if label.is_empty() { "host" } else { &label }, schemas: &[SCHEMA, coreq::telemetry::OBSERVATION_SCHEMA], installation: Some(&id), scope: None, capabilities: &[] };
     let a = coreq::enroll::pair(&dir, url, &req, wire)?;
     let unverified = |stage: String| format!("paired with {url}, not verified: {stage}; the service retries after its next check");
     let r = queue(home, &dir).map_err(unverified)?;
@@ -764,7 +774,7 @@ fn lock(home: &Path, what: &str) -> Result<File, String> {
     Ok(f)
 }
 
-fn audit(home: &Path, filesystem: &str, force: bool) -> Result<Value, String> {
+fn audit(home: &Path, filesystem: &str, force: bool, telemetry: &mut telemetry::Checks) -> Result<Value, String> {
     let rules: Obj = serde_json::from_slice(RULES).map_err(|e| format!("rules.json: {e}"))?;
     let number = |k: &str, field: &str| rules.get(k).and_then(|r| r[field].as_f64()).ok_or(format!("rules.json: {k} lacks {field}"));
     let now = now();
@@ -775,6 +785,7 @@ fn audit(home: &Path, filesystem: &str, force: bool) -> Result<Value, String> {
     }
     let mut results = Obj::new();
     let start = Instant::now();
+    let observed = telemetry::start();
     let fs_usage = statvfs(filesystem);
     if fs_usage.as_ref().err().is_none_or(|e| e != UNSUPPORTED) {
         profile::record("probe.statvfs", start, fs_usage.as_ref().err().map(|e| profile::class(e)));
@@ -790,12 +801,18 @@ fn audit(home: &Path, filesystem: &str, force: bool) -> Result<Value, String> {
             }
         }
     }
+    let observed = (observed.0, observed.1.elapsed());
+    for k in ["disk-headroom", "inode-headroom"] {
+        telemetry.record(home, k, observed, &results[k]);
+    }
     if !LINUX {
         for k in ["failed-services", "bounded-docker-logs", "bounded-journal"] {
+            let observed = telemetry::start();
             results.insert(k.into(), unsupported());
+            telemetry.record(home, k, (observed.0, observed.1.elapsed()), &results[k]);
         }
     } else {
-        linux_probes(&mut state, &mut results, now, &number)?;
+        linux_probes(home, telemetry, &mut state, &mut results, now, &number)?;
     }
     incidents(&mut state, &results, now)?;
     let manual: Vec<&String> = rules.iter().filter(|(_, r)| r["manual"] == true).map(|(k, _)| k).collect();
@@ -872,9 +889,14 @@ fn installation(home: &Path) -> Result<String, String> {
 }
 
 /// systemd and the system Docker socket exist only on Linux.
-fn linux_probes(state: &mut Obj, results: &mut Obj, now: f64, number: &dyn Fn(&str, &str) -> Result<f64, String>) -> Result<(), String> {
+fn linux_probes(home: &Path, telemetry: &mut telemetry::Checks, state: &mut Obj, results: &mut Obj, now: f64, number: &dyn Fn(&str, &str) -> Result<f64, String>) -> Result<(), String> {
+    let observed = telemetry::start();
     results.insert("failed-services".into(), failed_units(command(&["systemctl", "--failed", "--no-legend", "--plain", "--no-pager"])));
+    telemetry.record(home, "failed-services", (observed.0, observed.1.elapsed()), &results["failed-services"]);
+    let observed = telemetry::start();
     results.insert("bounded-docker-logs".into(), docker_logs(which("docker"), Path::new("/var/run/docker.sock").exists(), &mut |a| command(a)));
+    telemetry.record(home, "bounded-docker-logs", (observed.0, observed.1.elapsed()), &results["bounded-docker-logs"]);
+    let observed = telemetry::start();
     let journal = match journal_fingerprint() {
         Ok(fp) => {
             let cache = state.entry("cache").or_insert(json!({})).as_object_mut().ok_or("invalid state cache")?;
@@ -887,6 +909,7 @@ fn linux_probes(state: &mut Obj, results: &mut Obj, now: f64, number: &dyn Fn(&s
         Err(e) => unknown(COLLECTION, format!("Journal config unavailable: {e}")),
     };
     results.insert("bounded-journal".into(), journal);
+    telemetry.record(home, "bounded-journal", (observed.0, observed.1.elapsed()), &results["bounded-journal"]);
     Ok(())
 }
 
@@ -1218,7 +1241,7 @@ fn now() -> f64 {
 mod tests {
     use super::*;
 
-    fn scratch(tag: &str) -> PathBuf {
+    pub(super) fn scratch(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("serverq-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
@@ -1473,6 +1496,7 @@ mod tests {
             }
             match route {
                 "/connect/device" => {
+                    assert_eq!(body["schemas"], json!([SCHEMA, coreq::telemetry::OBSERVATION_SCHEMA]));
                     self.installation = body["installation"].clone();
                     reply(200, json!({"device_code": "d", "user_code": "ABCD-1234", "verification_uri": "https://dash.example/connect", "expires_in": 600, "interval": 5}))
                 }
@@ -1480,7 +1504,7 @@ mod tests {
                     let generation = self.grants.len() as u64 + 1;
                     self.grants.push((format!("cred-{generation}"), generation, self.workspace.clone(), false));
                     reply(200, json!({"credential": format!("cred-{generation}"), "installation": self.installation, "generation": generation, "product": "serverq",
-                        "workspace": self.workspace, "schemas": [SCHEMA]}))
+                        "workspace": self.workspace, "schemas": [SCHEMA, coreq::telemetry::OBSERVATION_SCHEMA]}))
                 }
                 "/connect/ack" => {
                     let generation = self.grants[g.unwrap()].1;
@@ -1593,6 +1617,47 @@ mod tests {
         assert_eq!(connection_pass(&home, true, &mut backoff, &mut dash), None);
         assert_eq!(coreq::enroll::active(&home.join("connection")), Ok(None));
         assert_eq!(dash.events.len(), 3);
+    }
+
+    /// A2/A3, R1/R3: the service shipper retries failed observations without a queued snapshot or a new audit.
+    #[test]
+    fn check_observations_service_delivery() {
+        let home = scratch("check-telemetry");
+        let mut telemetry = telemetry::Checks::default();
+        let (code, report) = check(&home, home.join("absent").to_str().unwrap(), false, &mut telemetry).unwrap();
+        assert_eq!(code, 2);
+        let saved_report = fs::read(home.join("report.json")).unwrap();
+        let mut dash = Dash { online: true, workspace: "ws-1".into(), now: 1000, ..Default::default() };
+        assert_eq!(enroll(&home, "https://dash.example", &mut dash), Ok(0));
+        assert!(!home.join("connection/snapshot.json").exists());
+        let mut backoff = coreq::enroll::Backoff::default();
+        let path = home.join("connection/connection.json");
+        let approved: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let mut legacy = approved.clone();
+        legacy["active"]["schemas"] = json!([SCHEMA]);
+        save_json(&path, &legacy).unwrap();
+        let sent = dash.events.len();
+        assert_eq!(telemetry.ship(&home, &mut backoff, &mut dash), None);
+        assert_eq!(dash.events.len(), sent, "an old grant cannot send observations without new approval");
+        save_json(&path, &approved).unwrap();
+        dash.online = false;
+        assert!(telemetry.ship(&home, &mut backoff, &mut dash).is_some());
+        dash.online = true;
+        assert_eq!(telemetry.ship(&home, &mut backoff, &mut dash), None);
+        let observations: Vec<_> = dash.events.iter().filter(|e| e.2["schema"] == coreq::telemetry::OBSERVATION_SCHEMA).collect();
+        assert_eq!(observations.len(), report["results"].as_object().unwrap().len());
+        for (_, _, r) in observations {
+            let o = &r["payload"]["observation"];
+            assert_eq!(o["outcome"], if report["results"][o["operation"].as_str().unwrap()]["status"] == "ok" { "ok" } else { "failed" });
+        }
+        assert_eq!(fs::read(home.join("report.json")).unwrap(), saved_report, "delivery never changes the report bytes");
+        assert_eq!(disconnect(&home, &mut dash), Ok(0));
+        let sent = dash.events.len();
+        check(&home, "/", false, &mut telemetry).unwrap();
+        assert_eq!(telemetry.ship(&home, &mut backoff, &mut dash), None);
+        assert_eq!(dash.events.len(), sent, "disconnect stops observation delivery");
+        drop(telemetry);
+        fs::remove_dir_all(home).unwrap();
     }
 
     #[test]

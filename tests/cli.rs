@@ -22,6 +22,70 @@ fn report(o: &Output) -> Value {
     serde_json::from_slice(&o.stdout).unwrap()
 }
 
+/// A2/A3, R1 and § 9: a collection failure must survive the binary/store/shipper/D11 boundary as failed.
+#[test]
+fn check_observations_reach_dashq_as_failed() {
+    use coreq::{enroll::{Backoff, Wire}, telemetry::Store};
+    #[derive(Default)]
+    struct Dash(Vec<Value>);
+    impl Wire for Dash {
+        fn post(&mut self, _: &str, route: &str, _: Option<&str>, body: &Value) -> Result<(u16, Value), String> {
+            assert_eq!(route, "/ingest");
+            let records = body["records"].as_array().unwrap();
+            self.0.extend(records.iter().cloned());
+            Ok((200, serde_json::json!({"protocol": 1, "receipts": records.iter().map(|r|
+                serde_json::json!({"event_id": r["event_id"], "state": "accepted"})).collect::<Vec<_>>()})))
+        }
+        fn now(&self) -> u64 { 0 }
+        fn sleep(&mut self, _: u64) {}
+        fn show(&mut self, _: &str, _: &str) {}
+    }
+    let home = scratch("observations");
+    let missing = home.join("private-absent-filesystem");
+    let output = check(&home, &["--filesystem", missing.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(report(&output)["results"]["disk-headroom"]["status"], "unknown");
+    assert!(home.join("telemetry.db").exists(), "each check must write a CoreQ observation");
+    let store = Store::open(&home.join("telemetry.db")).unwrap();
+    assert_eq!(store.shipper().unwrap()["cursor"], 0, "unshipped observations are protected before enrollment");
+    let connection = home.join("connection");
+    fs::create_dir_all(&connection).unwrap();
+    // Invented local grant; only the fake DashQ below receives it.
+    fs::write(connection.join("connection.json"), serde_json::json!({"installation": "invented", "active": {
+        "destination": "https://dash.example", "credential": "invented", "generation": 1}}).to_string()).unwrap();
+    let mut dash = Dash::default();
+    let shipped = store.ship(&connection, &mut Backoff::default(), &mut dash).unwrap();
+    assert_eq!(shipped.sent, RESULTS.len());
+    assert_eq!(dash.0.iter().map(|r| r["payload"]["observation"]["operation"].as_str().unwrap()).collect::<BTreeSet<_>>(), RESULTS.into());
+    for record in &dash.0 {
+        assert_eq!(record["schema"], "coreq-observation/1");
+        let o = &record["payload"]["observation"];
+        assert_eq!(o["kind"], "check");
+        assert!(o["started_ms"].as_u64().is_some() && o["duration_us"].as_u64().is_some());
+        assert!(o["host"].is_string() || o["unknown"]["host"].is_string());
+        assert!(!record.to_string().contains(home.to_str().unwrap()), "private paths stay local");
+        if ["disk-headroom", "inode-headroom"].contains(&o["operation"].as_str().unwrap()) {
+            let reason = if cfg!(windows) { "unsupported-os" } else { "collection-failed" };
+            assert_eq!((o["outcome"].as_str(), o["error"].as_str()), (Some("failed"), Some(reason)));
+            assert!(o["disk_bytes"].is_null());
+            assert_eq!(o["unknown"]["disk_bytes"], reason);
+        }
+    }
+    assert_eq!(store.shipper().unwrap()["backlog_rows"], 0);
+    drop(store);
+    // R1/R3: a corrupt observation store stays intact and cannot suppress or change the check report.
+    let corrupt = home.join("corrupt");
+    fs::create_dir(&corrupt).unwrap();
+    fs::write(corrupt.join("telemetry.db"), b"broken").unwrap();
+    let output = check(&corrupt, &["--filesystem", missing.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(report(&output)["results"]["disk-headroom"]["status"], "unknown");
+    assert_eq!(fs::read(corrupt.join("report.json")).unwrap(), output.stdout);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("telemetry unknown"));
+    assert_eq!(fs::read(corrupt.join("telemetry.db")).unwrap(), b"broken");
+    fs::remove_dir_all(home).unwrap();
+}
+
 #[test]
 fn real_cli_isolated_state_and_failure() {
     let home = scratch("real");
@@ -213,9 +277,17 @@ case $route in
   ok '"device_code":"d","user_code":"ABCD-1234","verification_uri":"https://dash.example/connect","expires_in":600,"interval":1';;
 /connect/token)
   [ -e "$d/approved" ] || { no 400 authorization_pending; exit; }
-  ok "\"credential\":\"cred-1\",\"installation\":\"$(cat "$d/installation")\",\"generation\":1,\"product\":\"serverq\",\"workspace\":\"ws-1\",\"schemas\":[\"serverq-report/1\"]";;
+  ok "\"credential\":\"cred-1\",\"installation\":\"$(cat "$d/installation")\",\"generation\":1,\"product\":\"serverq\",\"workspace\":\"ws-1\",\"schemas\":[\"serverq-report/1\",\"coreq-observation/1\"]";;
 /connect/ack) ok '"state":"active","generation":1';;
 /ingest)
+  case "$cfg" in *coreq-observation/1*)
+    receipts=
+    for id in $(printf '%s\n' "$cfg" | grep -o 'event_id\\":\\"[0-9a-f]*' | sed 's/.*\\"//'); do
+      grep -qx "$id" "$d/observations" 2>/dev/null || echo "$id" >> "$d/observations"
+      receipts="${receipts}${receipts:+,}{\"event_id\":\"$id\",\"state\":\"accepted\"}"
+    done
+    ok "\"receipts\":[$receipts]"; exit;;
+  esac
   grep -qx "$ev" "$d/events" 2>/dev/null || echo "$ev" >> "$d/events"
   [ -e "$d/lost" ] && { printf '\n000'; exit; }
   ok "\"receipts\":[{\"event_id\":\"$ev\",\"state\":\"accepted\"}]";;
@@ -304,6 +376,7 @@ fn enrollment_recovers_from_crashes() {
     fs::remove_file(dash.join("lost")).unwrap();
     let mut svc = cmd(&["service", "run"]).spawn().unwrap();
     wait(|| !home.join("connection/snapshot.json").exists());
+    wait(|| text(dash.join("observations")).lines().count() >= RESULTS.len());
     svc.kill().unwrap();
     let _ = svc.wait();
     let out = status();

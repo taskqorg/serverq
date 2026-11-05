@@ -2,7 +2,7 @@
 
 serverq checks a Linux server against the agreed server-care rules and reports deviations to agents and monitors. It never repairs a server, takes commands or promises uptime (R2, R3, R8).
 
-This file is the whole contract of **v1**, the Rust binary built on [coreq](https://github.com/taskqorg/coreq). It follows the [specq release contract](https://github.com/taskqorg/specq/blob/main/engineering/release-contract.md); coreq.md holds the shared update, launcher, service and `status.json` detail. The runtime uses coreq v0.19.2.
+This file is the whole contract of **v1**, the Rust binary built on [coreq](https://github.com/taskqorg/coreq). It follows the [specq release contract](https://github.com/taskqorg/specq/blob/main/engineering/release-contract.md); coreq.md holds the shared update, launcher, service and `status.json` detail. The runtime uses coreq v0.20.0, pinned to commit `a6096f7ac1710d9e4735b3763ca3a42a853912e1`.
 
 ## 1. Principles
 
@@ -81,7 +81,7 @@ coreq owns all of it; serverq passes tool name `serverq`, install folder and rel
 - Release: CI on a `v*` tag builds `serverq-<ver>-linux-<arch>` for `x86_64` and `aarch64`, `serverq-<ver>-windows-x86_64.exe` (§ 7), `serverq-<ver>-macos-aarch64` (§ 8), `SHA256SUMS` and `latest.json`.
 - Attestation: a separate job with only `id-token: write` and `attestations: write` attests each binary and `SHA256SUMS` with `actions/attest-build-provenance` (pinned by commit SHA) before the release is created.
 - One binary (static on Linux): hosts need no Python, git or toolchain. The repository keeps version `1.0.0-dev`; the tag sets the release version, so a build from a branch is older than any release.
-- Install folder `~/.local/share/serverq` (`<install>`): immutable `releases/<ver>/`, `current`, `previous`, the launcher `<install>/serverq`, `status.json`, `paused`, plus serverq's `report.json`, `state.json`, `installation`, `lock`, `profile.json`, `trace`, `trace.jsonl`.
+- Install folder `~/.local/share/serverq` (`<install>`): immutable `releases/<ver>/`, `current`, `previous`, the launcher `<install>/serverq`, `status.json`, `paused`, plus serverq's `report.json`, `state.json`, `installation`, `lock`, `profile.json`, `trace`, `trace.jsonl`, `telemetry.db` and its CoreQ sidecars.
 - Update: coreq steps (read `latest.json`, download into `releases/<ver>.tmp/`, verify sha256, `selftest`, swap `current`). Each update prunes `releases/` to `current` and `previous`; a folder in use stays until the next update.
 - Automatic rollback: the launcher restores `previous` after three `service run` starts of a version that never wrote `releases/<ver>/healthy`; `service run` writes it after its first completed check.
 - Manual `rollback` writes `previous` into `current`, swaps them, pauses updates and restarts an installed service; `service resume` returns to normal updates. coreq never reinstalls a version whose folder exists, so a rolled-back release returns only with a newer one.
@@ -110,6 +110,8 @@ One user unit, `serverq.service`, runs the checks and updates.
 - `snapshot.json` is the latest unsent record: schema `serverq-report/1`, event ID `r-` plus 32 hex of the payload's sha256, observed at the report's `at`. `sent.json` is the last accepted one.
 - With an active connection, each completed check replaces `snapshot.json` (coalesced: an older unsent one is dropped) and delivers it; `rejected` ends it. A transient failure retries after coreq's backoff without moving the check or update schedule.
 - Every pass retries queued revokes. Monitors read `report.json` or `status.json`; serverq adds no second scheduler, cleaner or notifier.
+- Enrollment requests both `serverq-report/1` and `coreq-observation/1`. After snapshot delivery, the same service pass calls CoreQ's observation shipper (§ 9), including when no snapshot is queued.
+  It uses its own backoff within the existing loop; delivery errors never change audit results or schedules. Existing grants without the observation schema need explicit reenrollment; no scope is expanded silently.
 
 ## 6. Host requirements
 
@@ -136,7 +138,7 @@ serverq follows [specq host requirements](https://github.com/taskqorg/specq/blob
 A Windows host runs the service and reports the Linux-only rules as unknown; Windows probes are a later task. Scheduled Task detail: [platforms](docs/design/platforms.md).
 
 - **Unsupported is unknown (R1).** Every rule whose probe is Linux-only is `unknown` with `reason: unsupported-os`, never `ok`, so `check` exits 2. On Windows that is all five automated rules (no `statvfs`, systemd or system Docker socket); on macOS the three systemd and Docker rules.
-- **Projection only (R3).** DashQ receives the allowlisted projection through the shared enrollment client; never upload raw `status.json` or `report.json`.
+- **Allowlisted delivery (R3).** DashQ receives the allowlisted projection and check observations (§ 9) through the shared enrollment client; never upload raw `status.json` or `report.json`.
 - Release: `serverq-<ver>-windows-x86_64.exe`, built and selftested like the Linux artifacts. Install folder `%LOCALAPPDATA%\serverq` (coreq default).
 - `service install` registers coreq's Scheduled Task `ServerQ-serverq` for this user's logon plus a time trigger repeating every 5 minutes, `LeastPrivilege`, no admin.
 - The task runs the GUI launcher `serverqw.exe` with `service run` and no other arguments, so `--home` other than the default is an error for `service install`.
@@ -159,6 +161,11 @@ serverq follows [specq built-in profiling](https://github.com/taskqorg/specq/blo
 - **No silent zero (R1).** An operation without samples reads `unknown` with `reason: no-samples`, a malformed record with `reason: corrupt-record`; neither reads as zero.
 - **No private data.** No message text, path, unit name or container ID is stored.
 - Counters are always on; traces are off until `<install>/trace` exists. serverq never retries, so no operation counts as retried.
+- **Check observations (R1, R3).** Each automated rule evaluation in § 3, including cached and unsupported results, writes one CoreQ `kind: check` observation with the rule ID as `operation`, UTC start, monotonic duration, outcome, error class and host.
+  CLI checks, install checks, selftest and service checks use this same path; manual rules emit none. `ok` maps to outcome `ok`, error `none`; `warn` and `unknown` map to `failed`, with the result's stable `reason` as the error class.
+  A failed collection leaves unavailable quantities null with that reason, never zero or healthy. Missing identity or context fields remain null with a reason; no path, raw error, unit name or container ID enters a record.
+- **One observation store and shipper.** `<install>/telemetry.db` is the installation's CoreQ local store, reused for the process lifetime. CoreQ `Store::ship` sends observations through the approved connection to DashQ D11, with durable cursors and cursor-safe pruning.
+  Store or shipper failures are reported as telemetry unknown, never as successful capture or delivery, and do not change the checks. The existing local profile remains during the shared contract's parity rollout; it is not an observation collector or export source.
 
 ## 10. Checks
 
