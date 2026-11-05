@@ -5,8 +5,9 @@ Binding detail of [serverq.md](../../serverq.md) § 7 and § 8: how `service` co
 ## Windows Scheduled Task
 
 - `service install` prepares and activates the immutable binary, then ends the running task before replacing its registration. coreq replaces a running launcher by rename, never by writing it in place.
-- It then registers coreq's Scheduled Task `ServerQ-serverq` from `<install>/ServerQ-serverq.xml`: this user's logon, `LeastPrivilege`, no admin, launcher supervision and `<install>/serverq.log` per coreq.md.
-- The task runs `service run` without arguments. The loop, `status.json` (`host` from `COMPUTERNAME`) and `service status` are serverq.md § 5.
+- It then registers coreq's Scheduled Task `ServerQ-serverq` from `<install>/ServerQ-serverq.xml`: this user's logon plus a time trigger repeating every 5 minutes, `IgnoreNew` for a running instance, `LeastPrivilege`, no admin, launcher supervision and `<install>/serverq.log` per coreq.md.
+- The task runs the GUI launcher `serverqw.exe` with `service run` and no other arguments, so a start opens no console. The loop, `status.json` (`host` from `COMPUTERNAME`) and `service status` are serverq.md § 5.
+- `stop` prints that it ends this run only: the repeating trigger starts the launcher again within 5 minutes, so a lasting stop is `uninstall`.
 - `schtasks /End` ends only the launcher, so `stop`, `restart` (then `/Run`), `uninstall` and a reinstall also end every other `serverq.exe` running from the install folder, except the caller and its launcher.
 - `uninstall` deletes the task, failing when this user may not (a task registered elevated), and its XML, never the install folder.
 - Files: no Unix modes or folder fsync; the install folder keeps the user's ACL. The lock opens with write access, which Windows needs to lock it.

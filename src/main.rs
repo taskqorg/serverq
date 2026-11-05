@@ -299,7 +299,12 @@ fn service(t: &coreq::Tool, cmd: &str) -> Result<i32, String> {
         _ if !LINUX && !cfg!(windows) && !cfg!(target_os = "macos") => return Err("the service requires Linux, Windows or macOS (serverq.md § 5, § 7, § 8)".into()),
         "install" => return install(t),
         "restart" => restart(t)?,
-        "stop" => end(t)?,
+        "stop" => {
+            if cfg!(windows) {
+                println!("serverq: stop ends this run only; the Scheduled Task starts it again within 5 minutes. For a lasting stop run `serverq service uninstall`.");
+            }
+            end(t)?
+        }
         "uninstall" => {
             let u = unit(t);
             if cfg!(windows) {
@@ -347,7 +352,8 @@ fn restart(t: &coreq::Tool) -> Result<(), String> {
     coreq::service::run_all(&unit(t).load[1..], false)
 }
 
-/// Stops the service until the next logon. Windows: `schtasks /End` ends only the launcher, so every other
+/// Ends the running service. Windows: the task's repeating trigger starts it again within 5 minutes (serverq.md § 7),
+/// and `schtasks /End` ends only the launcher, so every other
 /// `serverq.exe` of the install folder goes too, except this process and the launcher running it (coreq.md § Service units).
 fn end(t: &coreq::Tool) -> Result<(), String> {
     if cfg!(target_os = "macos") {
