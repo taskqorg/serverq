@@ -2,13 +2,13 @@
 
 serverq checks a Linux server against the agreed server-care rules and reports deviations to agents and monitors. It never repairs a server, takes commands or promises uptime (R2, R3, R8).
 
-This file is the whole contract of **v1**, the Rust binary built on [coreq](https://github.com/taskqorg/coreq). It follows the [specq release contract](https://github.com/taskqorg/specq/blob/main/engineering/release-contract.md); coreq.md holds the shared update, launcher, service and `status.json` detail. v1.0.0 replaces the Python `serverq.py` (0.2.x); the [legacy migration](docs/design/migration.md) moves a host over.
+This file is the whole contract of **v1**, the Rust binary built on [coreq](https://github.com/taskqorg/coreq). It follows the [specq release contract](https://github.com/taskqorg/specq/blob/main/engineering/release-contract.md); coreq.md holds the shared update, launcher, service and `status.json` detail. The runtime uses coreq v0.19.2.
 
 ## 1. Principles
 
 - **R1 Unknown is never healthy.** [specq verification](https://github.com/taskqorg/specq/blob/main/engineering/verification.md) binds serverq: unknown is never healthy (here the status `unknown`), and remediation is scoped and separate.
 - **R2 Read-only.** serverq writes only its own install folder. It never changes server settings, deletes operator data, resets failures, restarts other services, runs AI or applies recommendations. Remediation is a separate action by an agent or operator.
-- **R3 No command channel.** [Independent enrollment](docs/design/enrollment.md) adds explicitly approved observation delivery through coreq (§ 5); primary checks and recommendations remain read-only. No AgentQ/Langfuse dependency: DashQ can neither rerun nor repair a check.
+- **R3 No command channel.** Independent enrollment adds explicitly approved observation delivery through coreq (§ 5); primary checks and recommendations remain read-only. No AgentQ/Langfuse dependency: DashQ can neither rerun nor repair a check.
 - **R4 One catalog.** `rules.json` at the repository root is the only recommendation catalog. The binary embeds its exact bytes at build time; no other file, doc or agent copies its thresholds.
 - **R5 Manual rules stay manual.** A rule with `manual: true` is listed, never claimed as automatically verified. Exit 0 never certifies manual rules.
 - **R6 Dynamic checks every time.** Capacity and service checks run on every pass. Only configuration checks are cached (§ 3).
@@ -65,7 +65,7 @@ Checks, in the order of `rules.json`:
 - `reason` vocabulary: `unsupported-os`, `collection-failed`, `capacity-unavailable`, `below-minimum`, `failed-units`, `missing-journal-bounds`, `docker-cli-missing`, `unsupported-log-driver`, `missing-rotation`.
 - Files are written atomically (temp file, fsync, rename, directory fsync), mode 0600, in a 0700 folder.
 
-The projection ([enrollment](docs/design/enrollment.md)) holds only these fields:
+The projection holds only these fields:
 
 - **Allowlist (R3).** No `detail`, paths, unit names, container IDs or rule instructions; nothing beyond the fields below.
 - Top level: `schema` 1, `product`, `installation`, `version`, `runtime` (`<os>-<arch>`), `catalog`, `observed_at`, `rules`, `incidents`. `catalog` is the report's; a report without it has it only when its `revision` is this binary's, else null.
@@ -91,12 +91,12 @@ coreq owns all of it; serverq passes tool name `serverq`, install folder and rel
 
 ## 5. Service
 
-One user unit, `serverq.service`, replaces the four legacy units `serverq-check.service`, `serverq-check.timer`, `serverq-update.service` and `serverq-update.timer`.
+One user unit, `serverq.service`, runs the checks and updates.
 
 - **Checks never stop.** `pause` writes `<install>/paused` and stops updates only; checks continue, since stopping them would hide deviations. `resume` removes it.
 - **Stale is unknown (R1).** A `status.json` that is missing, unreadable, or holds a check older than 2 × `check_every` reads unknown with a reason.
 - **Delivery is passive (R3).** Delivery never changes a check result, its exit or its schedule; its outcome is one journal line. No heartbeat between checks: DashQ shows the report stale by its own observation time.
-- `service install` copies the running binary in as coreq `install_self` (current release and launcher); a legacy `~/.serverq` is migrated first ([migration](docs/design/migration.md)).
+- `service install` serializes with updates, rollback and native service changes through `<install>/lock`, freezes the running binary bytes, calls coreq `prepare_install`, then `activate_install` (current release and launcher), then stops and reinstalls the native unit on Windows/macOS. Preparation failures leave the active service untouched; activation errors report uncertainty.
 - On Linux it then writes `~/.config/systemd/user/serverq.service` running `<install>/serverq service run --home <install>` with `Restart=always`, `RestartSec=10`, and loads it with `daemon-reload` and `enable --now`.
 - serverq has one unit per host, not one per project, so it fills coreq's `Unit` itself instead of coreq's `<name>-<project>` unit. Windows: § 7. macOS: § 8. Another OS is an error.
 - A host that must check without a login session needs `loginctl enable-linger <user>` (an operator step; serverq does not run it).
@@ -105,8 +105,8 @@ One user unit, `serverq.service`, replaces the four legacy units `serverq-check.
 - One loop: a check and an update never overlap. A check result 1 is a normal pass, not a service failure. An installed update exits 75 and systemd starts the new `current`. Each pass prints one line to the journal.
 - `restart`, `stop` and `uninstall` run `systemctl --user restart`, `stop` and `disable --now`; `uninstall` also deletes the unit file, never the install folder.
 - `<install>/status.json` (coreq common keys, `project` `serverq`) adds `check`: `at`, `exit`, counts per status, `report` path, and `update_at`, `paused`. `error` holds the last check, update or requirement failure (§ 6).
-- `service status` prints `Check: ok|warn|unknown <age>` and `Update: <version|up to date|paused|unknown>`.
-- `<install>/connection/` holds coreq's `connection.json` (first seeded with `<install>/installation`, so the grant and the projection name one installation), `lock`, `snapshot.json` and `sent.json`.
+- `service status` prints `Check: ok|warn|unknown <age>` and `Update: <version|up to date|paused|unknown>`. Human time follows [specq Time](https://github.com/taskqorg/specq/blob/main/caveman/rules/indicators.md#time): age first with exact UTC beside it; an unavailable time reads `? unavailable`. Retry countdowns use the same shared formatter.
+- `<install>/connection/` holds coreq's `connection.json` (paired with `<install>/installation` through coreq's request identity, so the grant and the projection name one installation), `lock`, `snapshot.json` and `sent.json`.
 - `snapshot.json` is the latest unsent record: schema `serverq-report/1`, event ID `r-` plus 32 hex of the payload's sha256, observed at the report's `at`. `sent.json` is the last accepted one.
 - With an active connection, each completed check replaces `snapshot.json` (coalesced: an older unsent one is dropped) and delivers it; `rejected` ends it. A transient failure retries after coreq's backoff without moving the check or update schedule.
 - Every pass retries queued revokes. Monitors read `report.json` or `status.json`; serverq adds no second scheduler, cleaner or notifier.
@@ -138,7 +138,9 @@ A Windows host runs the service and reports the Linux-only rules as unknown; Win
 - **Unsupported is unknown (R1).** Every rule whose probe is Linux-only is `unknown` with `reason: unsupported-os`, never `ok`, so `check` exits 2. On Windows that is all five automated rules (no `statvfs`, systemd or system Docker socket); on macOS the three systemd and Docker rules.
 - **Projection only (R3).** DashQ receives the allowlisted projection through the shared enrollment client; never upload raw `status.json` or `report.json`.
 - Release: `serverq-<ver>-windows-x86_64.exe`, built and selftested like the Linux artifacts. Install folder `%LOCALAPPDATA%\serverq` (coreq default).
-- `service install` registers coreq's Scheduled Task `ServerQ-serverq` for this user's logon, `LeastPrivilege`, no admin; the task runs `service run` without arguments, so `--home` other than the default is an error for `service install`. `uninstall` deletes the task, never the install folder.
+- `service install` registers coreq's Scheduled Task `ServerQ-serverq` for this user's logon plus a time trigger repeating every 5 minutes, `LeastPrivilege`, no admin.
+- The task runs the GUI launcher `serverqw.exe` with `service run` and no other arguments, so `--home` other than the default is an error for `service install`.
+- `stop` ends the current run only and says so: the repeating trigger starts the launcher again within 5 minutes. A lasting stop is `uninstall`, which deletes the task, never the install folder.
 
 ## 8. macOS
 
@@ -148,7 +150,7 @@ LaunchAgent detail and qualification: [platforms](docs/design/platforms.md).
 - **No false update success (R1).** A missing macOS release artifact is an update error, never success.
 - **Data survives removal.** Removing the LaunchAgent reverses installation without deleting reports or credentials.
 - Release: `serverq-<ver>-macos-aarch64`, built and selftested on an Apple Silicon runner; checksums, attestation and updates follow § 4. Intel Macs are not a release target.
-- `service install` installs this user's LaunchAgent `com.serverq.serverq` through coreq. Only the default install folder (§ 4) is supported; a different `--home` or `SERVERQ_INSTALL` is an error before service effects. No legacy Linux migration on macOS.
+- `service install` installs this user's LaunchAgent `com.serverq.serverq` through coreq. Only the default install folder (§ 4) is supported; a different `--home` or `SERVERQ_INSTALL` is an error before service effects.
 
 ## 9. Profiling
 
@@ -163,16 +165,12 @@ serverq follows [specq built-in profiling](https://github.com/taskqorg/specq/blo
 `cargo test --locked`, then `serverq selftest`, then `serverq check --home <temp>` on the authorized host. The [contract lint](https://github.com/taskqorg/specq/blob/main/engineering/contracts.md#lint) checks this file in CI.
 
 - Tests cover enroll, coalesced delivery, receipts, crash recovery, cross-workspace reconnect and offline disconnect against a fake DashQ, each rule's `ok`/`warn`/`unknown`, cache hit, TTL and revision invalidation, corrupt state and exit codes.
-- They cover the migration steps against a fake legacy folder, update then rollback of an enrolled install against a fake release served by a fake `curl`, and `doctor` against tool fakes at, below and missing each minimum.
+- They cover install preparation failure without service effects, update then rollback of an enrolled install against a fake release served by a fake `curl`, `doctor` against tool fakes at, below and missing each minimum, and human-time boundaries.
 - Linux-only service tests compile only on Linux; on other OSes the CLI test asserts `unsupported-os`. CI runs the tests on Linux, Windows and macOS aarch64; the Scheduled Task is verified on the authorized Windows host.
 
 ## 11. Linked detail
 
 Binding detail, loaded on demand:
 
-- [docs/design/migration.md](docs/design/migration.md): the one-time move of a legacy Python `~/.serverq` by `service install`, its failure handling and rollback.
 - [docs/design/platforms.md](docs/design/platforms.md): the Windows Scheduled Task and macOS LaunchAgent lifecycle, and the macOS qualification.
 - [docs/design/profiling.md](docs/design/profiling.md): profiled operations and budgets, the `profile.json` store, traces and the ranked report.
-- [docs/design/enrollment.md](docs/design/enrollment.md): the accepted DashQ connection target and its qualification evidence.
-
-Proposal, not binding: [docs/design/dashboard-findings.md](docs/design/dashboard-findings.md) does not amend this contract.

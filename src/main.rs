@@ -10,20 +10,20 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod profile;
+mod time;
 
 const RULES: &[u8] = include_bytes!("../rules.json");
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DOCKER: [&str; 3] = ["docker", "--host", "unix:///var/run/docker.sock"];
 const USAGE: &str = "usage: serverq check [--force] [--filesystem PATH] | rules | projection | enroll URL [--headless] | connection status | disconnect | profile | doctor | update | rollback | selftest | service install|run|pause|resume|status|restart|stop|uninstall; every command takes --home PATH";
 const UNIT: &str = "serverq.service";
-const LEGACY_UNITS: [&str; 4] = ["serverq-check.timer", "serverq-update.timer", "serverq-check.service", "serverq-update.service"];
 const LINUX: bool = cfg!(target_os = "linux");
 const UNSUPPORTED: &str = "unsupported-os";
 /// coreq's Windows unit for project `serverq`: `<title>-<project>`.
 const TASK: &str = "ServerQ-serverq";
 /// The one schema a ServerQ grant covers (coreq-enrollment/1, DashQ C3).
 const SCHEMA: &str = "serverq-report/1";
-/// Fixed `reason` vocabulary of non-`ok` results; the projection exports nothing else (docs/design/enrollment.md).
+/// Fixed `reason` vocabulary of non-`ok` results; the projection exports nothing else (serverq.md § 3, § 5).
 const REASONS: [&str; 9] = [UNSUPPORTED, COLLECTION, "capacity-unavailable", "below-minimum", "failed-units", "missing-journal-bounds", "docker-cli-missing", "unsupported-log-driver", "missing-rotation"];
 
 type Obj = Map<String, Value>;
@@ -66,8 +66,7 @@ fn run(args: &[String]) -> Result<i32, String> {
         t.install = std::path::absolute(h).map_err(|e| format!("{h}: {e}"))?;
     }
     // the launcher copy only picks the release to run, before parsing: a newer release may take new arguments (coreq.md § Launcher)
-    let me = std::env::current_exe().and_then(fs::canonicalize).ok();
-    if me.is_some() && me == fs::canonicalize(t.install.join(t.exe_name())).ok() {
+    if std::env::current_exe().is_ok_and(|me| t.is_launcher(&me)) {
         coreq::launcher::launch(&t, args);
     }
     let start = Instant::now();
@@ -140,7 +139,7 @@ fn dispatch(t: &coreq::Tool, words: &[&str], filesystem: &str, force: bool, head
         }
         ["update"] => {
             print_unmet();
-            match coreq::update::update(t, false)? {
+            match update(t)? {
                 Some(v) => println!("serverq: updated to {v}"),
                 None => println!("serverq: up to date"),
             }
@@ -264,6 +263,7 @@ fn print_unmet() {
 
 /// `previous` becomes `current`, updates pause and an installed service restarts on the restored release.
 fn rollback(t: &coreq::Tool) -> Result<i32, String> {
+    let _held = lock(&t.install, "rollback")?;
     let read = |n: &str| fs::read_to_string(t.install.join(n)).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     let (Some(prev), Some(cur)) = (read("previous"), read("current")) else { return Err("no previous release to roll back to".into()) };
     if !t.release_exe(&prev).exists() {
@@ -286,6 +286,7 @@ fn service(t: &coreq::Tool, cmd: &str) -> Result<i32, String> {
             return Err("the LaunchAgent uses the default install folder; drop --home and SERVERQ_INSTALL".into());
         }
     }
+    let _held = if matches!(cmd, "restart" | "stop" | "uninstall") { Some(lock(&t.install, cmd)?) } else { None };
     let paused = t.install.join("paused");
     match cmd {
         "pause" => fs::write(&paused, "").map_err(|e| e.to_string())?,
@@ -296,11 +297,14 @@ fn service(t: &coreq::Tool, cmd: &str) -> Result<i32, String> {
         "status" => return service_status(t),
         "run" => return serve(t),
         _ if !LINUX && !cfg!(windows) && !cfg!(target_os = "macos") => return Err("the service requires Linux, Windows or macOS (serverq.md § 5, § 7, § 8)".into()),
-        "install" if cfg!(target_os = "macos") => return install_mac(t),
-        "install" if cfg!(windows) => return install_task(t),
         "install" => return install(t),
         "restart" => restart(t)?,
-        "stop" => end(t)?,
+        "stop" => {
+            if cfg!(windows) {
+                println!("serverq: stop ends this run only; the Scheduled Task starts it again within 5 minutes. For a lasting stop run `serverq service uninstall`.");
+            }
+            end(t)?
+        }
         "uninstall" => {
             let u = unit(t);
             if cfg!(windows) {
@@ -348,7 +352,8 @@ fn restart(t: &coreq::Tool) -> Result<(), String> {
     coreq::service::run_all(&unit(t).load[1..], false)
 }
 
-/// Stops the service until the next logon. Windows: `schtasks /End` ends only the launcher, so every other
+/// Ends the running service. Windows: the task's repeating trigger starts it again within 5 minutes (serverq.md § 7),
+/// and `schtasks /End` ends only the launcher, so every other
 /// `serverq.exe` of the install folder goes too, except this process and the launcher running it (coreq.md § Service units).
 fn end(t: &coreq::Tool) -> Result<(), String> {
     if cfg!(target_os = "macos") {
@@ -379,40 +384,7 @@ fn end(t: &coreq::Tool) -> Result<(), String> {
     coreq::service::run_all(&[["powershell", "-NoProfile", "-NonInteractive", "-Command", &script].map(String::from).to_vec()], false)
 }
 
-/// Windows: coreq's Scheduled Task `TASK` at this user's logon, no admin. It runs `service run` without
-/// arguments, so only the default install folder can be the service's.
-fn install_task(t: &coreq::Tool) -> Result<i32, String> {
-    if t.install != coreq::Tool::new("serverq", "ServerQ", "taskqorg/serverq", VERSION).install {
-        return Err("the Scheduled Task uses the default install folder; drop --home".into());
-    }
-    // a running launcher or service locks its exe against the copy below
-    end(t)?;
-    coreq::update::install_self(t)?;
-    println!("installed serverq {VERSION} as {}", t.install.join(t.exe_name()).display());
-    let u = unit(t);
-    coreq::service::write_unit(&u)?;
-    coreq::service::run_all(&u.load, false)?;
-    println!("started Scheduled Task from {}", u.path.display());
-    let (code, _) = check(&t.install, "/", false)?;
-    println!("check exit {code}, report {}", t.install.join("report.json").display());
-    print_unmet();
-    Ok(0)
-}
-
-/// serverq.md § 8: one LaunchAgent, no Linux migration or alternate install root.
-fn install_mac(t: &coreq::Tool) -> Result<i32, String> {
-    end(t)?;
-    coreq::update::install_self(t)?;
-    let u = unit(t);
-    coreq::service::write_unit(&u)?;
-    coreq::service::run_all(&u.load, false)?;
-    let (code, _) = check(&t.install, "/", false)?;
-    println!("installed LaunchAgent {}; check exit {code}", u.path.display());
-    print_unmet();
-    Ok(0)
-}
-
-/// The one user unit; on Linux it keeps the Python units' resource caps and sandbox.
+/// The one user unit; Linux resource caps and sandbox follow serverq.md § 5.
 fn unit(t: &coreq::Tool) -> coreq::service::Unit {
     if cfg!(windows) || cfg!(target_os = "macos") {
         return coreq::service::unit(t, &t.install, "serverq");
@@ -433,81 +405,33 @@ fn unit(t: &coreq::Tool) -> coreq::service::Unit {
     }
 }
 
-/// serverq.md § 5 and docs/design/migration.md: migrate a legacy `~/.serverq` once, install this binary, start the unit, run one check.
+/// Install one prepared binary, activate it, then register the native unit (serverq.md § 5).
 fn install(t: &coreq::Tool) -> Result<i32, String> {
-    let legacy = PathBuf::from(std::env::var_os("HOME").ok_or("HOME is not set")?).join(".serverq");
-    let real = fs::symlink_metadata(&legacy).is_ok_and(|m| m.is_dir());
-    let (held, migrated) = if real && (legacy.join("bootstrap").exists() || legacy.join("app").exists()) { (Some(migrate(t, &legacy)?), true) } else { (None, false) };
-    let rollback = format!(
-        "rollback: serverq service uninstall; rm {l}; mv {i}/legacy {l}; systemctl --user enable --now serverq-check.timer serverq-update.timer",
-        l = legacy.display(),
-        i = t.install.display()
-    );
-    let after = |e: String| if migrated { format!("{e}; {rollback}") } else { e };
-    coreq::update::install_self(t).map_err(after)?;
-    println!("6. installed serverq {VERSION} as {}", t.install.join("serverq").display());
-    let u = unit(t);
-    coreq::service::write_unit(&u).and_then(|_| coreq::service::run_all(&u.load, false)).map_err(after)?;
-    println!("6. started {}", u.path.display());
-    drop(held);
-    let (code, _) = check(&t.install, "/", false).map_err(after)?;
-    println!("6. check exit {code}, report {}", t.install.join("report.json").display());
-    if migrated {
-        println!("{rollback}");
+    if cfg!(windows) && t.install != coreq::Tool::new("serverq", "ServerQ", "taskqorg/serverq", VERSION).install {
+        return Err("the Scheduled Task uses the default install folder; drop --home".into());
     }
+    let held = lock(&t.install, "install")?;
+    let bytes = fs::read(std::env::current_exe().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    coreq::update::prepare_install(t, &bytes)?;
+    coreq::update::activate_install(t).map_err(|e| format!("activation uncertain; inspect current and the native service before retrying: {e}"))?;
+    if cfg!(windows) || cfg!(target_os = "macos") {
+        end(t)?;
+    }
+    let u = unit(t);
+    coreq::service::write_unit(&u)?;
+    coreq::service::run_all(&u.load, false)?;
+    println!("installed serverq {VERSION}; started {}", u.path.display());
+    drop(held);
+    let (code, _) = check(&t.install, "/", false)?;
+    println!("check exit {code}, report {}", t.install.join("report.json").display());
     print_unmet();
     Ok(0)
 }
 
-/// Steps 1-5 of docs/design/migration.md; returns the held legacy lock. A failure before step 5 restores the legacy timers.
-fn migrate(t: &coreq::Tool, legacy: &Path) -> Result<File, String> {
-    let held = OpenOptions::new().append(true).create(true).mode(0o600).open(legacy.join("lock")).map_err(|e| format!("legacy lock: {e}"))?;
-    held.try_lock().map_err(|_| "the legacy serverq is running; retry after it ends")?;
-    if legacy.join("transaction.json").exists() {
-        return Err("legacy transaction.json present: run the legacy check first, which recovers it".into());
-    }
-    let state = legacy.join("state.json");
-    if state.exists() {
-        load_state(&state)?;
-    }
-    let report = legacy.join("report.json");
-    if report.exists() {
-        let r: Value = fs::read(&report).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
-        if r["schema"] != 1 || !r["results"].is_object() {
-            return Err(format!("invalid legacy report {}; preserve it and investigate", report.display()));
-        }
-    }
-    println!("1-2. legacy lock taken; state.json and report.json valid");
-    let restore = |e: String| {
-        let back = systemctl(&["enable", "--now", LEGACY_UNITS[0], LEGACY_UNITS[1]]);
-        format!("{e}; legacy timers re-enabled: {}", back.map_or_else(|b| b, |_| "yes".into()))
-    };
-    systemctl(&[&["disable", "--now"][..], &LEGACY_UNITS[..2]].concat())
-        .and_then(|_| systemctl(&[&["stop"][..], &LEGACY_UNITS[2..]].concat()))
-        .map_err(restore)?;
-    println!("3. legacy units stopped; their files stay");
-    let copy = || -> Result<(), String> {
-        let _install = lock(&t.install, "check")?;
-        for f in [&state, &report].into_iter().filter(|f| f.exists()) {
-            let v: Value = serde_json::from_slice(&fs::read(f).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-            save_json(&t.install.join(f.file_name().unwrap_or_default()), &v)?;
-        }
-        Ok(())
-    };
-    copy().map_err(restore)?;
-    println!("4. state.json and report.json copied into {}", t.install.display());
-    let moved = t.install.join("legacy");
-    fs::rename(legacy, &moved).map_err(|e| restore(format!("move {}: {e}", legacy.display())))?;
-    #[cfg(unix)]
-    let linked = std::os::unix::fs::symlink(&t.install, legacy);
-    #[cfg(windows)]
-    let linked: std::io::Result<()> = Err(std::io::ErrorKind::Unsupported.into());
-    if let Err(e) = linked {
-        let _ = fs::rename(&moved, legacy);
-        return Err(restore(format!("link {}: {e}", legacy.display())));
-    }
-    println!("5. {} moved to {}; {} links to the install folder", legacy.display(), moved.display(), legacy.display());
-    Ok(held)
+/// Install and both update entry points share the audit lock, so releases cannot change concurrently.
+fn update(t: &coreq::Tool) -> Result<Option<String>, String> {
+    let _held = lock(&t.install, "update")?;
+    coreq::update::update(t, false)
 }
 
 fn every(var: &str, default: u64) -> Duration {
@@ -578,7 +502,7 @@ fn serve(t: &coreq::Tool) -> Result<i32, String> {
                 println!("serverq: update paused");
             } else {
                 let start = Instant::now();
-                let result = coreq::update::update(t, false);
+                let result = update(t);
                 profile::record("service.update", start, result.as_ref().err().map(|e| profile::class(e)));
                 profile::flush(&t.install);
                 match result {
@@ -624,24 +548,13 @@ fn hostname() -> String {
         .unwrap_or_default()
 }
 
-/// `<install>/connection`, coreq's connection folder; coreq's identity is first seeded with `<install>/installation`,
-/// so the grant and the projection name one installation.
-fn connection(home: &Path) -> Result<PathBuf, String> {
-    let dir = home.join("connection");
-    if !dir.join("connection.json").exists() {
-        // ponytail: writes coreq's documented initial state (coreq docs/design/enrollment.md § Client); coreq protects it on first load
-        let id = installation(home)?;
-        save_json(&dir.join("connection.json"), &json!({"installation": id, "pending": null, "active": null, "revoke": []}))?;
-    }
-    Ok(dir)
-}
-
-/// Pairs, sends the current projection and reports `Connected` only for its `projected` receipt (docs/design/enrollment.md).
+/// Pairs, sends the current projection and reports `Connected` only for its `projected` receipt (serverq.md § 3, § 5).
 fn enroll(home: &Path, url: &str, wire: &mut dyn coreq::enroll::Wire) -> Result<i32, String> {
-    let dir = connection(home)?;
+    let dir = home.join("connection");
     let _lock = lock(&dir, "enroll")?;
+    let id = installation(home)?;
     let label: String = hostname().chars().filter(|c| c.is_ascii_alphanumeric() || "._-".contains(*c)).take(64).collect();
-    let req = coreq::enroll::Request { product: "serverq", host_label: if label.is_empty() { "host" } else { &label }, schemas: &[SCHEMA], installation: None, scope: None, capabilities: &[] };
+    let req = coreq::enroll::Request { product: "serverq", host_label: if label.is_empty() { "host" } else { &label }, schemas: &[SCHEMA], installation: Some(&id), scope: None, capabilities: &[] };
     let a = coreq::enroll::pair(&dir, url, &req, wire)?;
     let unverified = |stage: String| format!("paired with {url}, not verified: {stage}; the service retries after its next check");
     let r = queue(home, &dir).map_err(unverified)?;
@@ -720,7 +633,7 @@ fn connection_pass(home: &Path, checked: bool, backoff: &mut coreq::enroll::Back
             None
         }
         Ok(Some(s)) => {
-            println!("serverq: connection: snapshot retry in {s}s");
+            println!("serverq: connection: snapshot retry in {}", time::countdown(Some(wire.now().saturating_add(s)), wire.now()));
             Some(s)
         }
         Err(e) => {
@@ -805,12 +718,16 @@ fn service_status(t: &coreq::Tool) -> Result<i32, String> {
     let max = 2 * every("SERVERQ_CHECK_EVERY", 3600).as_secs();
     let p = t.install.join("status.json");
     let s: Option<Value> = fs::read(&p).ok().and_then(|b| serde_json::from_slice(&b).ok());
-    let age = s.as_ref().and_then(|s| s["check"]["at"].as_u64()).map(|at| (now() as u64).saturating_sub(at));
+    let at = s.as_ref().and_then(|s| s["check"]["at"].as_u64());
+    let now = now() as u64;
+    let age = at.map(|at| now.saturating_sub(at));
+    let observed = time::age(at, now);
     let check = match (&s, age) {
-        (None, _) => format!("unknown ({} missing or unreadable)", p.display()),
-        (_, None) => "unknown (no check yet)".into(),
-        (_, Some(a)) if a > max => format!("unknown (last check {a}s ago, over {max}s)"),
-        (Some(s), Some(a)) => format!("{} {a}s ago", ["ok", "warn"].get(s["check"]["exit"].as_u64().unwrap_or(2) as usize).unwrap_or(&"unknown")),
+        (None, _) => format!("unknown (? unavailable; {} missing or unreadable)", p.display()),
+        (_, None) => "unknown (? unavailable; no check yet)".into(),
+        _ if observed == "? unavailable" => "unknown (? unavailable; no valid check time)".into(),
+        (_, Some(a)) if a > max => format!("unknown (last check {observed}, over {max}s)"),
+        (Some(s), Some(_)) => format!("{} {observed}", ["ok", "warn"].get(s["check"]["exit"].as_u64().unwrap_or(2) as usize).unwrap_or(&"unknown")),
     };
     let update = match &s {
         _ if t.install.join("paused").exists() => "paused".to_string(),
@@ -891,7 +808,7 @@ fn audit(home: &Path, filesystem: &str, force: bool) -> Result<Value, String> {
     Ok(report)
 }
 
-/// The allowlisted view of `report.json` for DashQ (docs/design/enrollment.md): rule IDs, enumerated values,
+/// The allowlisted view of `report.json` for DashQ (serverq.md § 3, § 5): rule IDs, enumerated values,
 /// times and numbers only; detail, paths, unit names and container IDs never leave. It reads, never reruns, a check.
 fn projection(home: &Path) -> Result<Value, String> {
     let p = home.join("report.json");
@@ -1611,7 +1528,7 @@ mod tests {
             "incidents": {}, "manual_rules": []}).to_string()).unwrap();
     }
 
-    /// docs/design/enrollment.md qualification against a fake DashQ: enroll, coalesced delivery, offline disconnect,
+    /// serverq.md § 3, § 5 qualification against a fake DashQ: enroll, coalesced delivery, offline disconnect,
     /// reconnect into another workspace, dashboard revoke; the report and its checks are never touched.
     #[test]
     fn connection_lifecycle() {

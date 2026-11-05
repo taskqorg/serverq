@@ -1,4 +1,4 @@
-//! The real `serverq` binary with isolated state, a fake legacy folder and a fake release.
+//! The real `serverq` binary with isolated state and a fake release.
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::fs;
@@ -43,7 +43,7 @@ fn real_cli_isolated_state_and_failure() {
             assert_eq!((r["results"][k]["status"].as_str(), r["results"][k]["reason"].as_str()), (Some("unknown"), Some("unsupported-os")), "{k}");
         }
     }
-    // docs/design/enrollment.md: the projection names the catalog of this report and no local path
+    // serverq.md § 3, § 5: the projection names the catalog of this report and no local path
     let projection = || Command::new(env!("CARGO_BIN_EXE_serverq")).args(["projection", "--home"]).arg(&home).output().unwrap();
     let p: Value = serde_json::from_slice(&projection().stdout).unwrap();
     assert_eq!(p["catalog"], r["catalog"]);
@@ -76,6 +76,32 @@ fn real_cli_isolated_state_and_failure() {
     assert_eq!((row["count"].as_u64(), row["errors"]["error"].as_u64()), (Some(1), Some(1)));
 }
 
+/// A4 / serverq.md § 5: CLI ages use one whole unit and show exact UTC; missing times stay unavailable.
+#[test]
+fn service_status_human_time() {
+    let home = scratch("human-time");
+    let run = || Command::new(env!("CARGO_BIN_EXE_serverq")).args(["service", "status", "--home"]).arg(&home).output().unwrap();
+    let missing = run();
+    assert_eq!(missing.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&missing.stdout).contains("? unavailable"));
+    let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + 3600;
+    fs::write(home.join("status.json"), serde_json::json!({"check": {"at": at, "exit": 0}}).to_string()).unwrap();
+    let fresh = run();
+    assert_eq!(fresh.status.code(), Some(0));
+    let out = String::from_utf8_lossy(&fresh.stdout);
+    assert!(out.contains("Check: ok <1m ago (") && out.contains(" UTC)"), "{out}");
+    fs::write(home.join("status.json"), r#"{"check":{"at":0,"exit":0}}"#).unwrap();
+    let stale = run();
+    assert_eq!(stale.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&stale.stdout).contains("d ago (1970-01-01 00:00 UTC)"));
+    for invalid in [serde_json::Value::Null, serde_json::json!(u64::MAX)] {
+        fs::write(home.join("status.json"), serde_json::json!({"check": {"at": invalid, "exit": 0}}).to_string()).unwrap();
+        let out = run();
+        assert_eq!(out.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&out.stdout).contains("? unavailable"));
+    }
+}
+
 #[test]
 fn exclusive_lock() {
     let home = scratch("lock");
@@ -90,6 +116,54 @@ fn bad_arguments_are_errors() {
     let home = scratch("args");
     assert_eq!(check(&home, &["--bogus"]).status.code(), Some(2));
     assert_eq!(Command::new(env!("CARGO_BIN_EXE_serverq")).output().unwrap().status.code(), Some(2));
+}
+
+/// A3 / serverq.md § 4–5: both Windows launchers honor current; a missing release cannot run embedded commands.
+#[cfg(windows)]
+#[test]
+fn windows_launchers_honor_current() {
+    use std::os::windows::process::CommandExt;
+
+    let home = scratch("launchers");
+    let tool = coreq::Tool { name: "serverq", title: "ServerQ", repo: "taskqorg/serverq", version: env!("CARGO_PKG_VERSION"), install: home.clone(), fault: None };
+    let bytes = fs::read(env!("CARGO_BIN_EXE_serverq")).unwrap();
+    coreq::update::prepare_install(&tool, &bytes).unwrap();
+    coreq::update::activate_install(&tool).unwrap();
+    for current in [tool.version, "9.9.9"] {
+        fs::write(home.join("current"), current).unwrap();
+        for name in [tool.exe_name(), tool.gui_exe_name()] {
+            let out = Command::new(home.join(&name)).arg("rules").env("SERVERQ_INSTALL", &home).creation_flags(0x0800_0000).output().unwrap();
+            if current == tool.version {
+                assert!(out.status.success(), "{name}: {}", String::from_utf8_lossy(&out.stderr));
+                assert_eq!(out.stdout, include_bytes!("../rules.json"));
+            } else {
+                assert_eq!(out.status.code(), Some(1), "{name} must refuse missing current");
+                assert!(out.stdout.is_empty(), "{name} must not dispatch embedded rules");
+                assert!(String::from_utf8_lossy(&out.stderr).contains("start 9.9.9"), "{name}: {}", String::from_utf8_lossy(&out.stderr));
+            }
+        }
+    }
+    fs::remove_dir_all(home).unwrap();
+}
+
+/// serverq.md § 7: the repeating trigger restarts the launcher, so Windows `stop` tells the operator it is temporary.
+/// Copies of this binary stand in for schtasks and powershell: Windows looks beside the running exe first, and the
+/// fake's nonzero exit (the real script exits 0) proves the host's real task was not touched.
+#[cfg(windows)]
+#[test]
+fn windows_stop_says_it_is_temporary() {
+    let home = scratch("stop");
+    let bin = home.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    for name in ["serverq.exe", "schtasks.exe", "powershell.exe"] {
+        fs::copy(env!("CARGO_BIN_EXE_serverq"), bin.join(name)).unwrap();
+    }
+    let out = Command::new(bin.join("serverq.exe")).args(["service", "stop"]).env("SERVERQ_INSTALL", &home).env("PATH", &bin).output().unwrap();
+    assert_eq!(out.status.code(), Some(2), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("`powershell"), "{}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("within 5 minutes") && stdout.contains("serverq service uninstall"), "{stdout}");
+    fs::remove_dir_all(home).unwrap();
 }
 
 /// serverq.md § 2: a never-enrolled install has no connection and refuses a non-HTTPS destination.
@@ -173,7 +247,7 @@ fn connection_files(install: &Path) -> Vec<(String, Vec<u8>)> {
     v
 }
 
-/// DashQ E3 (docs/design/enrollment.md) through the real binary and coreq's HTTPS wire against a fake DashQ: a crash
+/// DashQ E3 (serverq.md § 3, § 5) through the real binary and coreq's HTTPS wire against a fake DashQ: a crash
 /// before approval, between send and receipt, and of the service resumes without a second grant or a lost snapshot;
 /// connection state stays private (E5 storage).
 #[cfg(target_os = "linux")]
@@ -242,22 +316,21 @@ fn enrollment_recovers_from_crashes() {
     }
 }
 
-/// serverq.md § 5, § 4 and docs/design/migration.md against a fake legacy folder, a fake `systemctl` and a fake release served by a fake `curl`.
+/// serverq.md § 5 and § 4: preparation failure preserves the active files; install, service, update and rollback
+/// against a fake `systemctl` and a fake release served by a fake `curl` retain incidents, identity and credentials.
 #[cfg(target_os = "linux")]
 #[test]
-fn service_install_migrates_runs_updates_and_rolls_back() {
+fn service_install_runs_updates_and_rolls_back() {
     let d = scratch("service");
     let (home, bin, rel, log, dash) = (d.join("h"), d.join("bin"), d.join("rel"), d.join("systemctl.log"), d.join("dash"));
     let install = home.join(".local/share/serverq");
-    let legacy = home.join(".serverq");
-    for p in [&bin, &rel, &dash, &legacy.join("bootstrap")] {
+    for p in [&bin, &rel, &dash, &install] {
         fs::create_dir_all(p).unwrap();
     }
     write_exe(&bin.join("systemctl"), "#!/bin/sh\necho \"$*\" >> \"$FAKE_LOG\"\n");
     write_exe(&bin.join("curl"), FAKE_CURL);
     let incident = r#"{"first_seen": 1, "last_seen": 2, "occurrences": 2, "state": "observed"}"#;
-    fs::write(legacy.join("state.json"), format!(r#"{{"schema": 1, "cache": {{}}, "incidents": {{"disk-headroom": {incident}}}}}"#)).unwrap();
-    fs::write(legacy.join("report.json"), r#"{"schema": 1, "results": {}}"#).unwrap();
+    fs::write(install.join("state.json"), format!(r#"{{"schema": 1, "cache": {{}}, "incidents": {{"disk-headroom": {incident}}}}}"#)).unwrap();
     let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
     let run = |exe: &Path, args: &[&str]| {
         Command::new(exe).args(args).arg("--home").arg(&install).env("HOME", &home).env("PATH", &path).env("FAKE_LOG", &log).env("FAKE_RELEASE", &rel).env("FAKE_DASH", &dash).output().unwrap()
@@ -265,30 +338,30 @@ fn service_install_migrates_runs_updates_and_rolls_back() {
     let me = Path::new(env!("CARGO_BIN_EXE_serverq"));
     let version = env!("CARGO_PKG_VERSION");
 
-    fs::write(legacy.join("transaction.json"), "{}").unwrap();
-    assert_eq!(run(me, &["service", "install"]).status.code(), Some(2), "open legacy transaction");
-    assert!(fs::symlink_metadata(&legacy).unwrap().is_dir() && !log.exists(), "nothing changed");
-    fs::remove_file(legacy.join("transaction.json")).unwrap();
+    let release = install.join("releases").join(version).join("serverq");
+    fs::create_dir_all(release.parent().unwrap()).unwrap();
+    fs::write(&release, b"different bytes").unwrap();
+    assert_eq!(run(me, &["service", "install"]).status.code(), Some(2), "immutable release conflict");
+    assert_eq!(fs::read(&release).unwrap(), b"different bytes");
+    assert!(!log.exists() && !install.join("current").exists() && !install.join("serverq").exists(), "preparation failure has no service or activation effects");
+    fs::remove_file(&release).unwrap();
 
     let first = run(me, &["service", "install"]);
     assert!(first.status.success(), "{}", String::from_utf8_lossy(&first.stderr));
-    assert!(String::from_utf8_lossy(&first.stdout).contains("rollback: serverq service uninstall"));
-    assert_eq!(fs::read_link(&legacy).unwrap(), install);
-    assert!(install.join("legacy/bootstrap").is_dir(), "legacy folder kept");
     let state: Value = serde_json::from_str(&text(install.join("state.json"))).unwrap();
-    assert_eq!(state["incidents"]["disk-headroom"]["first_seen"], 1, "incidents carry over");
+    assert_eq!(state["incidents"]["disk-headroom"]["first_seen"], 1, "installation preserves existing incidents");
     let unit = text(home.join(".config/systemd/user/serverq.service"));
     for line in ["ProtectSystem=strict", "MemoryMax=128M", "Restart=always", &format!("ReadWritePaths={}", install.display()), &format!("ExecStart=\"{}/serverq\" service run", install.display())] {
         assert!(unit.contains(line), "{line}");
     }
     assert_eq!(
         text(&log).lines().filter(|l| l.starts_with("--user")).collect::<Vec<_>>().join("\n"),
-        "--user disable --now serverq-check.timer serverq-update.timer\n--user stop serverq-check.service serverq-update.service\n--user daemon-reload\n--user enable --now serverq.service"
+        "--user daemon-reload\n--user enable --now serverq.service"
     );
     assert_eq!(text(install.join("current")), version);
     fs::remove_file(&log).unwrap();
     assert!(run(me, &["service", "install"]).status.success());
-    assert!(!text(&log).contains("disable"), "a second install does not migrate");
+    assert_eq!(text(&log).lines().filter(|l| l.starts_with("--user")).collect::<Vec<_>>(), ["--user daemon-reload", "--user enable --now serverq.service"]);
 
     // the service through the launcher: an hourly check and a daily update, each one second here
     let launcher = install.join("serverq");
@@ -457,6 +530,16 @@ esac
         let o = run(&["service", cmd], false);
         assert_eq!(o.status.code(), Some(0), "{cmd}: {}", String::from_utf8_lossy(&o.stderr));
     }
+    // § 5: a preparation failure must not boot out a running LaunchAgent or change its registration.
+    let release = install.join("releases").join(env!("CARGO_PKG_VERSION")).join("serverq");
+    let bytes = fs::read(&release).unwrap();
+    let calls = fs::read(home.join("calls")).unwrap();
+    fs::write(&release, b"different bytes").unwrap();
+    assert_eq!(run(&["service", "install"], false).status.code(), Some(2));
+    assert_eq!(fs::read(home.join("calls")).unwrap(), calls);
+    assert!(home.join("loaded").exists());
+    assert_eq!(fs::read_to_string(&plist).unwrap(), xml);
+    fs::write(&release, bytes).unwrap();
     for cmd in ["stop", "restart", "uninstall", "install"] {
         assert_eq!(run(&["service", cmd], true).status.code(), Some(2));
         assert!(plist.exists(), "failed unload must preserve the registration file");
