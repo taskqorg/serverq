@@ -5,7 +5,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
-coreq = { git = "https://github.com/taskqorg/coreq", tag = "v0.19.2" }
+coreq = { git = "https://github.com/taskqorg/coreq", rev = "a6096f7ac1710d9e4735b3763ca3a42a853912e1" }
 libc = "0.2"
 ring = "0.17"
 serde_json = { version = "1", features = ["preserve_order"] }

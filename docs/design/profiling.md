@@ -20,8 +20,9 @@ Measured operations and budgets (p95 time, failure rate):
 
 ## Store
 
+- Check observations use the CoreQ store and shipper in [serverq.md § 9](../../serverq.md#9-profiling). The legacy counters below remain local until the shared rollout's parity requirement is met.
 - Each process keeps its samples in memory and merges them into `<install>/profile.json` when its command or service pass ends, only when `<install>` already exists.
-- `selftest`, `profile`, `doctor` and the connection commands (`enroll`, `connection status`, `disconnect`: they wait on the network and the owner's approval) record nothing.
+- `selftest`, `profile`, `doctor` and the connection commands (`enroll`, `connection status`, `disconnect`: they wait on the network and the owner's approval) record no legacy counters. Selftest's check observations stay in its temporary install.
 - Concurrent writers may lose a sample, never corrupt the file.
 - `profile.json` schema 1, per operation: `count`, `failed`, `errors` (class to count), `first`, `last` (Unix seconds) and `ms`, the last 200 durations.
 - Each merge rebuilds the file from valid records of the operation names above with only these fields, so the file stays bounded and foreign content is dropped. An unreadable file or malformed record is replaced by the next merge.
