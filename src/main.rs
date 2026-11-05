@@ -1626,6 +1626,7 @@ mod tests {
         let mut telemetry = telemetry::Checks::default();
         let (code, report) = check(&home, home.join("absent").to_str().unwrap(), false, &mut telemetry).unwrap();
         assert_eq!(code, 2);
+        let saved_report = fs::read(home.join("report.json")).unwrap();
         let mut dash = Dash { online: true, workspace: "ws-1".into(), now: 1000, ..Default::default() };
         assert_eq!(enroll(&home, "https://dash.example", &mut dash), Ok(0));
         assert!(!home.join("connection/snapshot.json").exists());
@@ -1649,7 +1650,7 @@ mod tests {
             let o = &r["payload"]["observation"];
             assert_eq!(o["outcome"], if report["results"][o["operation"].as_str().unwrap()]["status"] == "ok" { "ok" } else { "failed" });
         }
-        assert_eq!(serde_json::from_slice::<Value>(&fs::read(home.join("report.json")).unwrap()).unwrap(), report);
+        assert_eq!(fs::read(home.join("report.json")).unwrap(), saved_report, "delivery never changes the report bytes");
         assert_eq!(disconnect(&home, &mut dash), Ok(0));
         let sent = dash.events.len();
         check(&home, "/", false, &mut telemetry).unwrap();
