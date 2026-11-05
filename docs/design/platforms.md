@@ -4,7 +4,7 @@ Binding detail of [serverq.md](../../serverq.md) § 7 and § 8: how `service` co
 
 ## Windows Scheduled Task
 
-- `service install` ends a running task first (Windows locks a running exe), then copies the binary in as on Linux.
+- `service install` prepares and activates the immutable binary, then ends the running task before replacing its registration. coreq replaces a running launcher by rename, never by writing it in place.
 - It then registers coreq's Scheduled Task `ServerQ-serverq` from `<install>/ServerQ-serverq.xml`: this user's logon, `LeastPrivilege`, no admin, launcher supervision and `<install>/serverq.log` per coreq.md.
 - The task runs `service run` without arguments. The loop, `status.json` (`host` from `COMPUTERNAME`) and `service status` are serverq.md § 5.
 - `schtasks /End` ends only the launcher, so `stop`, `restart` (then `/Run`), `uninstall` and a reinstall also end every other `serverq.exe` running from the install folder, except the caller and its launcher.
@@ -13,9 +13,9 @@ Binding detail of [serverq.md](../../serverq.md) § 7 and § 8: how `service` co
 
 ## macOS LaunchAgent
 
-- `service install` uses coreq v0.11.0 to install the binary and this user's `~/Library/LaunchAgents/com.serverq.serverq.plist`, label `com.serverq.serverq`, running the launcher with `service run`.
+- `service install` uses coreq v0.19.2 to install the binary and this user's `~/Library/LaunchAgents/com.serverq.serverq.plist`, label `com.serverq.serverq`, running the launcher with `service run`.
 - The LaunchAgent uses `RunAtLoad` and `KeepAlive`, the install folder as its working directory and `serverq.log` there for output. It needs a logged-in GUI user, no admin. Linux sandbox and resource caps do not apply.
-- Install/reinstall stops only this label, writes the unit, bootstraps it and runs one check.
+- Install/reinstall prepares and activates the immutable binary before stopping this label, writes the unit, bootstraps it and runs one check.
 - `stop` boots out this label; `restart` boots it out then bootstraps it; `uninstall` boots it out and removes only its plist, never install data.
 - An absent label is harmless; other launchctl failures are errors. Rollback is serverq.md § 4.
 - The host label comes from `hostname`. The serverq.md § 5 loop sends only the § 3 projection, retains its schedule and checks for updates.
