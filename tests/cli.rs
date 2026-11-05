@@ -146,6 +146,26 @@ fn windows_launchers_honor_current() {
     fs::remove_dir_all(home).unwrap();
 }
 
+/// serverq.md § 7: the repeating trigger restarts the launcher, so Windows `stop` tells the operator it is temporary.
+/// Copies of this binary stand in for schtasks and powershell: Windows looks beside the running exe first, and the
+/// fake's nonzero exit (the real script exits 0) proves the host's real task was not touched.
+#[cfg(windows)]
+#[test]
+fn windows_stop_says_it_is_temporary() {
+    let home = scratch("stop");
+    let bin = home.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    for name in ["serverq.exe", "schtasks.exe", "powershell.exe"] {
+        fs::copy(env!("CARGO_BIN_EXE_serverq"), bin.join(name)).unwrap();
+    }
+    let out = Command::new(bin.join("serverq.exe")).args(["service", "stop"]).env("SERVERQ_INSTALL", &home).env("PATH", &bin).output().unwrap();
+    assert_eq!(out.status.code(), Some(2), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("`powershell"), "{}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("within 5 minutes") && stdout.contains("serverq service uninstall"), "{stdout}");
+    fs::remove_dir_all(home).unwrap();
+}
+
 /// serverq.md § 2: a never-enrolled install has no connection and refuses a non-HTTPS destination.
 #[test]
 fn connection_commands_without_enrollment() {
