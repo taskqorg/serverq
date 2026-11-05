@@ -66,8 +66,7 @@ fn run(args: &[String]) -> Result<i32, String> {
         t.install = std::path::absolute(h).map_err(|e| format!("{h}: {e}"))?;
     }
     // the launcher copy only picks the release to run, before parsing: a newer release may take new arguments (coreq.md § Launcher)
-    let me = std::env::current_exe().and_then(fs::canonicalize).ok();
-    if me.is_some() && me == fs::canonicalize(t.install.join(t.exe_name())).ok() {
+    if std::env::current_exe().is_ok_and(|me| t.is_launcher(&me)) {
         coreq::launcher::launch(&t, args);
     }
     let start = Instant::now();

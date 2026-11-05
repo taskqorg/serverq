@@ -118,6 +118,34 @@ fn bad_arguments_are_errors() {
     assert_eq!(Command::new(env!("CARGO_BIN_EXE_serverq")).output().unwrap().status.code(), Some(2));
 }
 
+/// A3 / serverq.md § 4–5: both Windows launchers honor current; a missing release cannot run embedded commands.
+#[cfg(windows)]
+#[test]
+fn windows_launchers_honor_current() {
+    use std::os::windows::process::CommandExt;
+
+    let home = scratch("launchers");
+    let tool = coreq::Tool { name: "serverq", title: "ServerQ", repo: "taskqorg/serverq", version: env!("CARGO_PKG_VERSION"), install: home.clone(), fault: None };
+    let bytes = fs::read(env!("CARGO_BIN_EXE_serverq")).unwrap();
+    coreq::update::prepare_install(&tool, &bytes).unwrap();
+    coreq::update::activate_install(&tool).unwrap();
+    for current in [tool.version, "9.9.9"] {
+        fs::write(home.join("current"), current).unwrap();
+        for name in [tool.exe_name(), tool.gui_exe_name()] {
+            let out = Command::new(home.join(&name)).arg("rules").env("SERVERQ_INSTALL", &home).creation_flags(0x0800_0000).output().unwrap();
+            if current == tool.version {
+                assert!(out.status.success(), "{name}: {}", String::from_utf8_lossy(&out.stderr));
+                assert_eq!(out.stdout, include_bytes!("../rules.json"));
+            } else {
+                assert_eq!(out.status.code(), Some(1), "{name} must refuse missing current");
+                assert!(out.stdout.is_empty(), "{name} must not dispatch embedded rules");
+                assert!(String::from_utf8_lossy(&out.stderr).contains("start 9.9.9"), "{name}: {}", String::from_utf8_lossy(&out.stderr));
+            }
+        }
+    }
+    fs::remove_dir_all(home).unwrap();
+}
+
 /// serverq.md § 2: a never-enrolled install has no connection and refuses a non-HTTPS destination.
 #[test]
 fn connection_commands_without_enrollment() {
