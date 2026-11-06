@@ -107,9 +107,13 @@ fn run(args: &[String]) -> Result<i32, String> {
         ["projection"]=>"projection", ["enroll",_]=>"enroll", ["connection","status"]=>"connection",
         ["disconnect"]=>"disconnect", ["doctor"]=>"doctor", ["update"]=>"update", ["rollback"]=>"rollback",
         ["profile"]=>"profile", ["inventory-worker",_]=>"inventory-worker", ["service","run"]=>"service-run",
+        ["service","install"]=>"service-install", ["service","uninstall"]=>"service-uninstall",
+        ["service","status"]=>"service-status", ["service","restart"]=>"service-restart",
+        ["service","stop"]=>"service-stop", ["service","pause"]=>"service-pause", ["service","resume"]=>"service-resume",
         ["service",_]=>"service", ["selftest"]=>"selftest", _=>"other",
     };
-    let span=tracing::info_span!("cli",coreq_operation=command,coreq_result="unclassified",coreq_error=tracing::field::Empty);
+    let host=telemetry::host_label();
+    let span=tracing::info_span!("cli",host=host.as_deref(),coreq_operation=command,coreq_result="unclassified",coreq_error=tracing::field::Empty);
     let entered=span.enter();
     let result = parsed.and_then(|()| dispatch(&t, &words, &filesystem, force, headless));
     match &result {
@@ -403,7 +407,7 @@ fn systemctl(args: &[&str]) -> Result<(), String> {
 fn restart(t: &coreq::Tool) -> Result<(), String> {
     if cfg!(target_os = "macos") {
         end(t)?;
-        return coreq::service::run_all(&unit(t).load, false);
+        return start_unit(t,&unit(t));
     }
     if !cfg!(windows) {
         return systemctl(&["restart", UNIT]);
@@ -412,36 +416,118 @@ fn restart(t: &coreq::Tool) -> Result<(), String> {
     coreq::service::run_all(&unit(t).load[1..], false)
 }
 
+/// Read native metadata only; no arguments or environment values in `launchctl list`.
+fn mac_state(target: &str, until: Instant) -> Result<(bool,Option<coreq::process::Identity>),String> {
+    coreq::telemetry::capture::poll("service.native-state",0,|| {
+        let remaining=until.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {return Err("native state timeout".into());}
+        let out=coreq::process::output("service.list",Command::new("launchctl").arg("list"),remaining).map_err(|e|format!("launchctl list: {e}"))?;
+        let label=target.rsplit('/').next().ok_or("invalid service label")?;
+        for line in String::from_utf8(out.stdout).map_err(|_|"invalid native state")?.lines() {
+            let fields=line.split_whitespace().collect::<Vec<_>>();
+            if fields.len()==3 && fields[2]==label {
+                if fields[0]=="-" {return Ok((true,None));}
+                let pid=fields[0].parse().map_err(|_|"invalid native pid")?;
+                return coreq::process::identity(pid).map(|id|(true,id)).map_err(|_|"native process identity unavailable".into());
+            }
+        }
+        Ok((false,None))
+    },|result|match result {Ok((false,_))=>"absent",Ok((true,Some(_)))=>"running",Ok((true,None))=>"loaded-no-pid",Err(_)=>"native-state-unavailable"})
+}
+
+fn start_unit(t: &coreq::Tool, unit: &coreq::service::Unit) -> Result<(),String> {
+    if !cfg!(target_os="macos") {return coreq::service::run_all(&unit.load,false);}
+    let until=Instant::now()+Duration::from_secs(30);
+    let command=&unit.load[0];
+    for attempt in 0..2 {
+        let remaining=until.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {return Err("native bootstrap timeout; start unconfirmed".into());}
+        match coreq::process::output("service.bootstrap",Command::new(&command[0]).args(&command[1..]),remaining) {
+            Ok(_)=>return Ok(()),
+            Err(coreq::process::Failure::Exit(out)) if out.status.code()==Some(5) && attempt==0 => {
+                if mac_state(&unit.stop[0][2],until)?.0 {return Err("native bootstrap failed; job present, start uncertain; no retry".into());}
+                telemetry::Checks::default().retry(&t.install,"launchd-bootstrap",1);
+                std::thread::sleep(Duration::from_secs(1).min(until.saturating_duration_since(Instant::now())));
+            }
+            Err(e)=>return Err(format!("launchctl bootstrap: {e}")),
+        }
+    }
+    Err("native bootstrap start unconfirmed".into())
+}
+
 /// Ends the running service. Windows: the task's repeating trigger starts it again within 5 minutes (serverq.md § 7),
 /// and `schtasks /End` ends only the launcher, so every other
-/// `serverq.exe` of the install folder goes too, except this process and the launcher running it (coreq.md § Service units).
+/// ServerQ executable of the install folder goes too, except this process and the launcher running it (coreq.md § Service units).
 fn end(t: &coreq::Tool) -> Result<(), String> {
     if cfg!(target_os = "macos") {
         let u = unit(t);
         let c = &u.stop[0];
-        let o = Command::new(&c[0]).args(&c[1..]).output().map_err(|e| format!("`{}`: {e}", c.join(" ")))?;
-        // launchctl reports ESRCH (3) when this label is already absent.
-        return if o.status.success() || o.status.code() == Some(3) { Ok(()) }
-        else { Err(format!("`{}` failed: {}: {}", c.join(" "), o.status, String::from_utf8_lossy(&o.stderr).trim())) };
+        return coreq::telemetry::capture::operation("service.stop",|| {
+            let until=Instant::now()+Duration::from_secs(30);
+            let (loaded,old)=mac_state(&c[2],until)?;
+            if !loaded {return Ok(());}
+            match coreq::process::output("service.bootout",Command::new(&c[0]).args(&c[1..]),until.saturating_duration_since(Instant::now())) {
+                Ok(_) => {},
+                Err(coreq::process::Failure::Exit(out)) if out.status.code()==Some(3)=>{},
+                Err(e)=>return Err(format!("launchctl bootout: {e}")),
+            }
+            loop {
+                let (loaded,_)=mac_state(&c[2],until)?;
+                let exited=match &old {Some(old)=>coreq::process::identity(old.pid).map_err(|_|"native process identity unavailable")?.as_ref()!=Some(old),None=>true};
+                if !loaded && exited {return Ok(());}
+                if Instant::now()>=until {return Err("native stop timeout; process exit unconfirmed".into());}
+                std::thread::sleep(Duration::from_millis(100).min(until.saturating_duration_since(Instant::now())));
+            }
+        },|_|"native-stop-unconfirmed");
     }
     if !cfg!(windows) {
         return systemctl(&["stop", UNIT]);
     }
     coreq::service::run_all(&unit(t).stop, true)?;
-    // ponytail: PowerShell CIM, the one stock tool that lists processes with their paths; no double quotes, which the
-    // Windows command line would mangle. Stop-Process does not wait for the exit, so wait up to 5 s before calling a
-    // process a survivor.
+    // Hold the native object while reading creation time and path; termination rechecks that incarnation.
+    let until=Instant::now()+Duration::from_secs(30);
     let script = format!(
-        "$me = {pid}; $up = (Get-CimInstance Win32_Process -Filter ('ProcessId=' + $me)).ParentProcessId; \
-         $mine = {{ Get-CimInstance Win32_Process -Filter 'Name=''serverq.exe''' | \
-         Where-Object {{ $_.ProcessId -notin @($me, $up) -and ([string]$_.ExecutablePath).StartsWith('{dir}\\', 'OrdinalIgnoreCase') }} }}; \
-         & $mine | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue; 'ended ' + $_.ProcessId + ' ' + $_.ExecutablePath }}; \
-         foreach ($i in 1..20) {{ if (-not (& $mine)) {{ exit 0 }}; Start-Sleep -Milliseconds 250 }}; \
-         'serverq processes of the install folder survived'; exit 1",
-        pid = std::process::id(),
-        dir = t.install.display().to_string().replace('\'', "''")
+        "$ErrorActionPreference='Stop'; $me = {pid}; \
+         $up = (Get-CimInstance Win32_Process -Filter ('ProcessId=' + $me) -Property ParentProcessId).ParentProcessId; \
+         if($null -eq $up) {{ throw 'parent identity unavailable' }}; $targets=@(); \
+         foreach($p in @(Get-Process -Name serverq,serverqw -ErrorAction SilentlyContinue)) {{ \
+          if($p.Id -in @($me,$up)) {{ continue }}; try {{ $held=$p.Handle; if($p.HasExited) {{ continue }}; \
+          $started=$p.StartTime.ToFileTimeUtc().ToString(); $image=$p.Path; \
+          if([string]::IsNullOrEmpty($image)) {{ throw 'process image unavailable' }}; \
+          if($image.StartsWith('{dir}\\','OrdinalIgnoreCase')) {{ $targets += [pscustomobject]@{{pid=$p.Id;started=$started}} }} \
+          }} catch {{ if($p.HasExited) {{ continue }}; throw }} \
+         }}; ConvertTo-Json -InputObject @($targets) -Compress",
+        pid=std::process::id(),dir=t.install.display().to_string().replace('\'',"''")
     );
-    coreq::service::run_all(&[["powershell", "-NoProfile", "-NonInteractive", "-Command", &script].map(String::from).to_vec()], false)
+    let output=coreq::process::output("service.processes",Command::new("powershell").args(["-NoProfile","-NonInteractive","-Command",&script]),until.saturating_duration_since(Instant::now()))
+        .map_err(|e|format!("`powershell` process metadata: {e}"))?;
+    let targets=windows_targets(&output.stdout)?;
+    for target in &targets {
+        coreq::telemetry::capture::operation("service.process-stop",|| {
+            tracing::Span::current().record("process_id",u64::from(target.pid));
+            if Instant::now()>=until {return Err("native stop timeout; exit unconfirmed".to_string());}
+            match coreq::process::terminate(target) {
+                Ok(())=>{},Err(e) if e.kind()==std::io::ErrorKind::NotFound=>{},
+                Err(_)=>return Err("native process termination unconfirmed".into()),
+            }
+            loop {
+                if coreq::process::identity(target.pid).map_err(|_|"native process identity unavailable")?.as_ref()!=Some(target) {return Ok(());}
+                if Instant::now()>=until {return Err("native stop timeout; exit unconfirmed".into());}
+                std::thread::sleep(Duration::from_millis(100).min(until.saturating_duration_since(Instant::now())));
+            }
+        },|_|"native-stop-unconfirmed")?;
+    }
+    Ok(())
+}
+
+fn windows_targets(bytes: &[u8]) -> Result<Vec<coreq::process::Identity>,String> {
+    let value:Value=serde_json::from_slice(bytes).map_err(|_|"invalid native process metadata")?;
+    value.as_array().ok_or("invalid native process metadata")?.iter().map(|row| {
+        if row.as_object().is_none_or(|o|o.len()!=2) {return Err("invalid native process metadata".into());}
+        let pid=row["pid"].as_u64().filter(|p|*p>0 && *p<=i32::MAX as u64).ok_or("invalid native process pid")? as u32;
+        let started=row["started"].as_str().filter(|text|text.parse::<u64>().is_ok_and(|n|n>0 && n.to_string()==*text)).ok_or("invalid native process incarnation")?;
+        Ok(coreq::process::Identity {pid,started:started.into()})
+    }).collect()
 }
 
 /// The one user unit; Linux resource caps and sandbox follow serverq.md § 5.
@@ -496,7 +582,7 @@ fn install(t: &coreq::Tool) -> Result<i32, String> {
         end(t)?;
     }
     coreq::service::write_unit(&u)?;
-    coreq::service::run_all(&u.load, false)?;
+    start_unit(t,&u)?;
     if LINUX&&replacing {restart(t)?;}
     println!("installed serverq {VERSION}; started {}", u.path.display());
     drop(held);
@@ -1348,6 +1434,17 @@ mod tests {
 
     fn status(v: &Value) -> &str {
         v["status"].as_str().unwrap()
+    }
+
+    #[test]
+    fn native_process_targets_require_exact_creation_identity() {
+        let valid=windows_targets(br#"[{"pid":7,"started":"123"}]"#).unwrap();
+        assert_eq!(valid[0],coreq::process::Identity {pid:7,started:"123".into()});
+        for invalid in [json!({}),json!([{"pid":0,"started":"123"}]),json!([{"pid":u64::MAX,"started":"123"}]),
+            json!([{"pid":7,"started":"00123"}]),json!([{"pid":7,"started":"private-output"}]),
+            json!([{"pid":7,"started":"123","command":"invented-private-output"}])] {
+            assert!(windows_targets(invalid.to_string().as_bytes()).is_err());
+        }
     }
 
     #[test]

@@ -10,6 +10,11 @@ pub struct Checks {
 
 static STORE: std::sync::OnceLock<(PathBuf, std::sync::Weak<Store>)> = std::sync::OnceLock::new();
 
+pub fn host_label() -> Option<String> {
+    let host=crate::hostname();
+    (!host.is_empty() && host.len()<=128 && host.bytes().all(|c|c.is_ascii_alphanumeric() || b"._:-".contains(&c))).then_some(host)
+}
+
 pub fn start_capture(home: &Path) -> Option<coreq::telemetry::capture::Runtime> {
     let result=(|| {
         let mut builder=std::fs::DirBuilder::new();builder.recursive(true);
@@ -184,10 +189,12 @@ impl Checks {
 
     pub fn retry(&mut self, home: &Path, source: &'static str, seconds: u64) {
         let at=SystemTime::now().duration_since(UNIX_EPOCH).ok().and_then(|d|u64::try_from(d.as_millis()).ok());
-        let mut value=json!({"product":"serverq","version":crate::VERSION,"kind":"operation","operation":"delivery.retry",
-            "started_ms":at,"outcome":"retried","error":"delivery-retry","source":source,"units":seconds,"unit_kind":"seconds",
+        let (operation,error)=if source=="launchd-bootstrap" {("service.retry","native-bootstrap-retry")} else {("delivery.retry","delivery-retry")};
+        let mut value=json!({"product":"serverq","version":crate::VERSION,"kind":"operation","operation":operation,
+            "started_ms":at,"host":host_label(),"outcome":"retried","error":error,"source":source,"units":seconds,"unit_kind":"seconds",
             "trace":null,"span":null,"unknown":{"trace":"no-caller","span":"no-caller","started_ms":"clock-unavailable"}});
         if at.is_some() {value["unknown"].as_object_mut().unwrap().remove("started_ms");}
+        if value["host"].is_null() {value["unknown"]["host"]="host-unavailable".into();}
         if let Err(e)=self.observe(home,value) {eprintln!("serverq: telemetry unknown: {e}");}
     }
 
@@ -196,8 +203,7 @@ impl Checks {
         let at = start.0.duration_since(UNIX_EPOCH).ok().and_then(|d| u64::try_from(d.as_millis()).ok());
         let ok = result["status"] == "ok";
         let reason = result["reason"].as_str().filter(|s| crate::REASONS.contains(s)).unwrap_or("unknown-result");
-        let host = crate::hostname();
-        let host = (!host.is_empty() && host.len() <= 128 && host.bytes().all(|c| c.is_ascii_alphanumeric() || b"._:-".contains(&c))).then_some(host);
+        let host = host_label();
         let mut value = json!({"product": "serverq", "version": crate::VERSION, "kind": "check", "operation": operation,
             "started_ms": at, "duration_us": duration, "outcome": if ok { "ok" } else { "failed" }, "error": if ok { "none" } else { reason },
             "host": host, "runtime": format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH), "runtime_version": crate::VERSION,

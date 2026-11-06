@@ -4,7 +4,8 @@ Binding detail of [serverq.md](../../serverq.md) § 9 under [specq built-in prof
 
 ## Universal capture
 
-- CLI roots: `serverq.cli.check`, `inspect`, `import`, `rules`, `projection`, `enroll`, `connection`, `disconnect`, `doctor`, `update`, `rollback`, `profile`, `inventory-worker`, `service-run`, `service` and `other` (suffixes of `serverq.cli.`). Command arguments never become operation names.
+- CLI roots: `serverq.cli.check`, `inspect`, `import`, `rules`, `projection`, `enroll`, `connection`, `disconnect`, `doctor`, `update`, `rollback`, `profile`, `inventory-worker`, `service-run`, `service-install`, `service-uninstall`, `service-status`, `service-restart`, `service-stop`, `service-pause`, `service-resume`, `service` (unknown verb) and `other` (suffixes of `serverq.cli.`). Command arguments never become operation names.
+- Native lifecycle: `serverq.operation.service.stop`, `service.bootstrap`, `service.bootout` and `service.list` (the last three are suffixes of `serverq.operation.`); `service.native-state` uses CoreQ poll observations. Windows `serverq.operation.service.process-stop` names each target PID and finishes only after its incarnation exits. A reconciled bootstrap retry is `service.retry`, distinct from delivery retries.
 - Service passes: `serverq.service.pass`; checks and updates: `serverq.operation.service.check` and `serverq.operation.service.update`. Paused updates are refused with `paused`.
 - Delivery: `serverq.delivery.snapshot` and `serverq.operation.telemetry.ship`; a requested retry records `delivery-retry`, not success. `delivery.retry` records the retry schedule as `retried`, with its source and wait in seconds. Dependency processes use CoreQ capture, including handled failures and timeout/cleanup evidence.
 - Checks inherit their CLI or service caller. Imported inventory keeps its original sample trace and producer time; success still requires durable append. Capture is not an import receipt.
