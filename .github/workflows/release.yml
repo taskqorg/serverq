@@ -14,11 +14,6 @@ jobs:
             arch: x86_64
             target: x86_64-unknown-linux-musl
             name: linux-x86_64
-          # No local Linux arm64 host.
-          - os: '"ubuntu-24.04-arm"'
-            arch: aarch64
-            target: aarch64-unknown-linux-musl
-            name: linux-aarch64
           - os: '["self-hosted", "macOS", "ARM64", "taskq-mac"]'
             arch: aarch64
             target: aarch64-apple-darwin
@@ -83,7 +78,7 @@ jobs:
           import json, os, sys
           ver = sys.argv[1]
           files = {n[len(f'serverq-{ver}-'):].removesuffix('.exe'): n for n in sorted(os.listdir('.')) if n.startswith(f'serverq-{ver}-')}
-          assert set(files) == {'linux-x86_64', 'linux-aarch64', 'windows-x86_64', 'macos-aarch64'}, files
+          assert set(files) == {'linux-x86_64', 'windows-x86_64', 'macos-aarch64'}, files
           json.dump({'version': ver, 'files': files}, open('latest.json', 'w'), indent=1)
           PY
       - id: provenance
