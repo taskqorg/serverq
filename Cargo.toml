@@ -7,8 +7,9 @@ publish = false
 [dependencies]
 cap-std = "3.4.5"
 cap-fs-ext = "3.4.5"
-coreq = { git = "https://github.com/taskqorg/coreq", rev = "175e5ac2dfa09bb29875a74e4b9883891b76ea3d" }
+coreq = { git = "https://github.com/taskqorg/coreq", rev = "eef0e59040581d5c9d6dc1306bb194ec7c4748ca" }
 libc = "0.2"
+tracing = "0.1"
 ring = "0.17"
 serde_json = { version = "1", features = ["preserve_order"] }
 sysinfo = { version = "0.37.2", default-features = false, features = ["system", "disk"] }

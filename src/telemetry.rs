@@ -1,12 +1,41 @@
 //! Check observations and CoreQ's shipper (serverq.md § 9); never changes an audit result.
 use coreq::{enroll::{Backoff, Delivery, Wire}, telemetry::{Event, Store}};
 use serde_json::{Value, json};
-use std::{path::Path, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
+use std::{path::{Path, PathBuf}, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
 
 #[derive(Default)]
 pub struct Checks {
     store: Option<std::sync::Arc<Store>>,
-    resources: Option<coreq::resources::Watch>,
+}
+
+static STORE: std::sync::OnceLock<(PathBuf, std::sync::Weak<Store>)> = std::sync::OnceLock::new();
+
+pub fn start_capture(home: &Path) -> Option<coreq::telemetry::capture::Runtime> {
+    let result=(|| {
+        let mut builder=std::fs::DirBuilder::new();builder.recursive(true);
+        #[cfg(unix)] {use std::os::unix::fs::DirBuilderExt;builder.mode(0o700);}
+        builder.create(home).map_err(|e|e.to_string())?;
+        let metadata=std::fs::symlink_metadata(home).map_err(|e|e.to_string())?;
+        if !metadata.is_dir() {return Err("telemetry installation root is not a real directory".into());}
+        #[cfg(unix)] {
+            use std::os::unix::fs::MetadataExt;
+            if metadata.uid()!=unsafe {libc::geteuid()} || metadata.mode()&0o077!=0 {
+                return Err("telemetry installation root is not private and owned; permissions unchanged".into());
+            }
+        }
+        bootstrap(home)
+    })();
+    match result { Ok(runtime)=>Some(runtime),Err(e)=>{eprintln!("serverq: telemetry unknown: {e}");None} }
+}
+
+/// One process collector shares the exact writer used by imports and the shipper.
+pub fn bootstrap(home: &Path) -> Result<coreq::telemetry::capture::Runtime, String> {
+    let mut checks=Checks::default();
+    checks.store(home)?;
+    let store=checks.store.as_ref().unwrap().clone();
+    let runtime=coreq::telemetry::capture::Runtime::install_store(store.clone(),"serverq",crate::VERSION)?;
+    STORE.set((home.to_path_buf(),std::sync::Arc::downgrade(&store))).map_err(|_|"telemetry already initialized")?;
+    Ok(runtime)
 }
 
 // CoreQ exposes cursor initialization through ship; recording must never send a backlog inline.
@@ -128,6 +157,9 @@ pub fn start() -> (SystemTime, Instant) {
 
 impl Checks {
     fn store(&mut self, home: &Path) -> Result<&Store, String> {
+        if self.store.is_none() && let Some((path, store))=STORE.get() && path==home {
+            self.store=store.upgrade();
+        }
         if self.store.is_none() {
             let path = home.join("telemetry.db");
             let store = Store::open_bounded(&path,coreq::telemetry::Budget {
@@ -144,11 +176,19 @@ impl Checks {
         Ok(self.store.as_ref().unwrap().as_ref())
     }
 
-    pub fn start_resources(&mut self,home:&Path) -> Result<(),String> {
-        self.store(home)?;
-        let store=self.store.as_ref().unwrap().clone();
-        self.resources=Some(coreq::resources::watch(home,"serverq",crate::VERSION,move|events|store.append(events).map(|_|()))?);
-        Ok(())
+    fn observe(&mut self, home: &Path, value: Value) -> Result<(),String> {
+        if STORE.get().is_some_and(|(path,store)|path==home && store.strong_count()>0) {
+            coreq::telemetry::capture::observe(value)
+        } else { self.store(home)?.append(&[Event::observation(value)?]).map(|_|()) }
+    }
+
+    pub fn retry(&mut self, home: &Path, source: &'static str, seconds: u64) {
+        let at=SystemTime::now().duration_since(UNIX_EPOCH).ok().and_then(|d|u64::try_from(d.as_millis()).ok());
+        let mut value=json!({"product":"serverq","version":crate::VERSION,"kind":"operation","operation":"delivery.retry",
+            "started_ms":at,"outcome":"retried","error":"delivery-retry","source":source,"units":seconds,"unit_kind":"seconds",
+            "trace":null,"span":null,"unknown":{"trace":"no-caller","span":"no-caller","started_ms":"clock-unavailable"}});
+        if at.is_some() {value["unknown"].as_object_mut().unwrap().remove("started_ms");}
+        if let Err(e)=self.observe(home,value) {eprintln!("serverq: telemetry unknown: {e}");}
     }
 
     pub fn record(&mut self, home: &Path, operation: &str, start: (SystemTime, Duration), result: &Value) {
@@ -169,7 +209,7 @@ impl Checks {
             if value[field].is_null() { value["unknown"][field] = reason.into(); }
         }
         if !value["disk_bytes"].is_null() { value["unknown"].as_object_mut().unwrap().remove("disk_bytes"); }
-        let record = (|| { self.store(home)?.append(&[Event::observation(value)?])?; Ok::<_, String>(()) })();
+        let record = self.observe(home,value);
         if let Err(e) = record {
             eprintln!("serverq: telemetry unknown: {e}");
         }
@@ -180,10 +220,11 @@ impl Checks {
         let mut rejected = 0;
         let result = (|| {
             let mut events = vec![];
+            let host=crate::hostname();
             let base = |operation: &str| json!({"product": "serverq", "version": crate::VERSION, "kind": "operation",
                 "operation": operation, "trace": sample["trace"], "span": null, "unknown": {"span": "no-caller"},
                 "started_ms": sample["at_ms"], "duration_us": sample["duration_us"],
-                "runtime": format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH), "host": crate::hostname(), "source": if sample["source"]=="ssh-diagnostic" {"ssh-diagnostic"} else {"native"}});
+                "runtime": format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH), "host": host, "source": if sample["source"]=="ssh-diagnostic" {"ssh-diagnostic"} else {"native"}});
             for row in sample["entities"].as_array().ok_or("invalid-inventory")? {
                 let ok = row["unknown"].as_object().is_some_and(|r| r.is_empty()) && row["status"] != "unknown";
                 let mut event = base("inventory.sample");
@@ -250,7 +291,9 @@ impl Checks {
             Ok(None) => return None,
             Err(e) => { eprintln!("serverq: telemetry unknown: {e}"); return Some(backoff.next(None)); }
         }
-        let result = self.store(home).map_err(Delivery::Stopped).and_then(|store| store.ship(&connection, backoff, wire));
+        let result = coreq::telemetry::capture::operation("telemetry.ship",||self.store(home).map_err(Delivery::Stopped).and_then(|store| store.ship(&connection, backoff, wire)),|error|match error {
+            Delivery::Retry(_)=>"delivery-retry",Delivery::Stopped(_)=>"delivery-stopped",
+        });
         match result {
             Ok(done) => {
                 if done.sent > 0 || done.rejected > 0 {
@@ -258,7 +301,7 @@ impl Checks {
                 }
                 done.more.then_some(2)
             }
-            Err(Delivery::Retry(seconds)) => Some(seconds),
+            Err(Delivery::Retry(seconds)) => {self.retry(home,"observation",seconds);Some(seconds)},
             Err(Delivery::Stopped(e)) => { eprintln!("serverq: telemetry unknown: {e}"); Some(backoff.next(None)) }
         }
     }

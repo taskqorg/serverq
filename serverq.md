@@ -3,7 +3,7 @@
 serverq checks server-care rules and reports read-only host, workload and disk inventory to agents and monitors. It never repairs a server, takes commands, runs AI or promises uptime (R2, R3, R8).
 
 This file is the whole contract of **v1**, the Rust binary built on [coreq](https://github.com/taskqorg/coreq). It follows the [specq release contract](https://github.com/taskqorg/specq/blob/main/engineering/release-contract.md); coreq.md holds the shared update, launcher, service and `status.json` detail.
-The runtime uses CoreQ v0.23.2, pinned to `175e5ac2dfa09bb29875a74e4b9883891b76ea3d`, with bounded output, attested updates and R56 self-resource observations. Observation batches protect their enrollment once; delivery rechecks the current grant before sending.
+The runtime uses CoreQ v0.23.3, pinned to `eef0e59040581d5c9d6dc1306bb194ec7c4748ca`, with bounded output, attested updates and R56 self-resource observations. Capture shares the existing writer; Windows tasks use normal priority. Delivery rechecks the current grant before sending.
 
 ## 1. Principles
 
@@ -98,7 +98,7 @@ One user unit, `serverq.service`, runs the checks and updates.
 
 - **Checks never stop.** `pause` writes `<install>/paused` and stops updates only; checks continue, since stopping them would hide deviations. `resume` removes it.
 - **Stale is unknown (R1).** A `status.json` that is missing, unreadable, or holds a check older than 2 × `check_every` reads unknown with a reason.
-- **Delivery is passive (R3).** Delivery never changes a check result, its exit or its schedule; its outcome is one journal line. No heartbeat between checks: DashQ shows the report stale by its own observation time.
+- **Delivery is passive (R3).** Delivery never changes a check result, its exit or its schedule; its outcome and retry reason are CoreQ observations. Resource samples never refresh the report: DashQ shows it stale by its own observation time.
 - `service install` serializes with updates, rollback and native service changes through `<install>/lock`, freezes the running binary bytes, calls coreq `prepare_install`, then `activate_install` (current release and launcher), then stops and reinstalls the native unit on Windows/macOS. Preparation failures leave the active service untouched; activation errors report uncertainty.
 - On Linux it then writes `~/.config/systemd/user/serverq.service` running `<install>/serverq service run --home <install>` with `Restart=always`, `RestartSec=10`, and loads it with `daemon-reload` and `enable --now`.
 - A matching existing unit is restarted so reinstall runs the activated release; another installation's unit is refused. Explicit `update` also restarts an installed service after a successful activation.
@@ -166,7 +166,10 @@ serverq follows [specq built-in profiling](https://github.com/taskqorg/specq/blo
 
 - **No silent zero (R1).** An operation without samples reads `unknown` with `reason: no-samples`, a malformed record with `reason: corrupt-record`; neither reads as zero.
 - **Metadata only.** No message text, file content, environment value or credential is stored. Typed inventory identities are the sole exception to the check observations' ban on paths, unit names and container IDs (§ 11).
-- Counters are always on; traces are off until `<install>/trace` exists. serverq never retries, so no operation counts as retried.
+- Legacy counters are always on; legacy traces are off until `<install>/trace` exists. Delivery retries keep their CoreQ outcomes and backoff; a retry never establishes recovery.
+- CoreQ universal capture starts before CLI, worker and service execution on the same retained store. Commands, service passes and dependency failures inherit caller context; refusals and delivery retries keep their reasons. Missing terminal evidence stays unknown.
+  Capture creates a private root when absent; an existing linked, non-private or foreign-owned Unix root is refused without changing its permissions.
+  Selftest uses only its temporary installation and closes capture before removal. Capture failure remains unknown without changing product exit codes.
 - **Check observations (R1, R3).** Each automated rule evaluation in § 3, including cached and unsupported results, writes one CoreQ `kind: check` observation with the rule ID as `operation`, UTC start, monotonic duration, outcome, error class and host.
   CLI checks, install checks, selftest and service checks use this same path; manual rules emit none. `ok` maps to outcome `ok`, error `none`; `warn` and `unknown` map to `failed`, with the result's stable `reason` as the error class.
   A failed collection leaves unavailable quantities null with that reason, never zero or healthy. Missing identity or context fields remain null with a reason; no path, raw error, unit name or container ID enters a record.

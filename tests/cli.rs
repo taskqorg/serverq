@@ -11,6 +11,10 @@ fn scratch(tag: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("serverq-cli-{tag}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&d);
     fs::create_dir_all(&d).unwrap();
+    #[cfg(unix)] {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&d,fs::Permissions::from_mode(0o700)).unwrap();
+    }
     fs::write(d.join("inventory.json"),"[]").unwrap();
     d
 }
@@ -107,12 +111,12 @@ fn diagnostic_import_is_host_scoped_typed_and_preserves_producer_time() {
     let at=sample["at_ms"].clone();let file=home.join("diagnostic.json");fs::write(&file,sample.to_string()).unwrap();
     let run=||Command::new(me).arg("import").arg(&file).arg("--home").arg(&dest).output().unwrap();
     let imported=run();assert!(imported.status.success(),"{}",String::from_utf8_lossy(&imported.stderr));
-    let count={let store=coreq::telemetry::Store::open(&dest.join("telemetry.db")).unwrap();let rows=store.export(0,0,1024).unwrap();
+    let count={let store=coreq::telemetry::Store::open(&dest.join("telemetry.db")).unwrap();let rows=store.export_kinds(&["inventory","operation"],0,0,1024).unwrap();
         assert!(rows["events"].as_array().unwrap().iter().any(|r|r["observation"]["kind"]=="inventory"&&r["observation"]["started_ms"]==at));
-        rows["events"].as_array().unwrap().len()};
+        rows["events"].as_array().unwrap().iter().filter(|r|r["observation"]["source"]=="ssh-diagnostic").count()};
     sample["entities"][0]["command"]="invented-authority".into();fs::write(&file,sample.to_string()).unwrap();
     assert!(!run().status.success());
-    let store=coreq::telemetry::Store::open(&dest.join("telemetry.db")).unwrap();assert_eq!(store.export(0,0,1024).unwrap()["events"].as_array().unwrap().len(),count);
+    let store=coreq::telemetry::Store::open(&dest.join("telemetry.db")).unwrap();assert_eq!(store.export_kinds(&["inventory","operation"],0,0,1024).unwrap()["events"].as_array().unwrap().iter().filter(|r|r["observation"]["source"]=="ssh-diagnostic").count(),count);
     drop(store);fs::remove_dir_all(home).unwrap();fs::remove_dir_all(dest).unwrap();
 }
 
@@ -141,6 +145,10 @@ fn inventory_probe_failure_keeps_local_cause_private() {
     let store = coreq::telemetry::Store::open(&home.join("telemetry.db")).unwrap();
     let records = store.export(0, 0, 1024).unwrap();
     assert!(!records.to_string().contains("invented-private-probe-error"));
+    assert!(records["events"].as_array().unwrap().iter().any(|r| {
+        let o=&r["observation"];
+        o["operation"]=="serverq.operation.probe.command" && o["kind"]=="method" && o["outcome"]=="failed"
+    }),"handled native failure must remain queryable without the private log");
     let services = records["events"].as_array().unwrap().iter().map(|e| &e["observation"])
         .find(|o| o["operation"] == "inventory.services").unwrap();
     assert_eq!(services["error"], "collection-failed");
@@ -191,6 +199,13 @@ fn check_observations_reach_dashq_as_failed() {
     while store.ship(&connection, &mut backoff, &mut dash).unwrap().more {}
     let checks: Vec<_> = dash.0.iter().filter(|r| r["payload"]["observation"]["kind"] == "check").collect();
     assert!(shipped.sent >= RESULTS.len());
+    let observations=dash.0.iter().map(|r|&r["payload"]["observation"]).collect::<Vec<_>>();
+    let command=observations.iter().find(|o|o["operation"]=="serverq.cli.check" && o["kind"]=="method").expect("missing terminal command");
+    assert_eq!(command["outcome"],"failed");assert_eq!(command["error"],"unknown-result");
+    for check in &checks {
+        let o=&check["payload"]["observation"];
+        assert_eq!(o["trace"],command["trace"]);assert_eq!(o["span"],command["span"]);
+    }
     assert_eq!(checks.len(), RESULTS.len(), "inventory does not replace any rule observation");
     assert_eq!(checks.iter().map(|r| r["payload"]["observation"]["operation"].as_str().unwrap()).collect::<BTreeSet<_>>(), RESULTS.into());
     for record in checks {
@@ -315,7 +330,7 @@ fn exclusive_lock() {
 fn bad_arguments_are_errors() {
     let home = scratch("args");
     assert_eq!(check(&home, &["--bogus"]).status.code(), Some(2));
-    assert_eq!(Command::new(env!("CARGO_BIN_EXE_serverq")).output().unwrap().status.code(), Some(2));
+    assert_eq!(Command::new(env!("CARGO_BIN_EXE_serverq")).arg("--home").arg(&home).output().unwrap().status.code(), Some(2));
 }
 
 /// A3 / serverq.md § 4–5: both Windows launchers honor current; a missing release cannot run embedded commands.
@@ -703,10 +718,13 @@ fn doctor_checks_host_requirements() {
 
 #[test]
 fn selftest_and_rules() {
-    let out = Command::new(env!("CARGO_BIN_EXE_serverq")).arg("selftest").output().unwrap();
+    let home=scratch("selftest");
+    let out = Command::new(env!("CARGO_BIN_EXE_serverq")).args(["selftest","--home"]).arg(&home).output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    let rules = Command::new(env!("CARGO_BIN_EXE_serverq")).arg("rules").output().unwrap();
+    assert!(!home.join("telemetry.db").exists(),"selftest must keep capture inside its temporary installation");
+    let rules = Command::new(env!("CARGO_BIN_EXE_serverq")).args(["rules","--home"]).arg(&home).output().unwrap();
     assert_eq!(rules.stdout, fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("rules.json")).unwrap());
+    fs::remove_dir_all(home).unwrap();
 }
 
 /// serverq.md § 8: install owns one LaunchAgent; all lifecycle commands preserve data, reject alternate roots
@@ -779,5 +797,24 @@ esac
     assert!(install.join("current").exists());
     let calls = fs::read_to_string(home.join("calls")).unwrap();
     assert!(calls.lines().all(|line| line.contains("com.serverq.serverq")));
+    fs::remove_dir_all(home).unwrap();
+}
+
+// Capturing a read-only command must not chmod an arbitrary existing directory or follow its link.
+#[cfg(unix)]
+#[test]
+fn capture_refuses_an_unsafe_root_without_changing_it() {
+    use std::os::unix::fs::{PermissionsExt,symlink};
+    let home=scratch("capture-root");
+    let shared=home.join("shared");fs::create_dir(&shared).unwrap();
+    fs::set_permissions(&shared,fs::Permissions::from_mode(0o755)).unwrap();
+    let linked=home.join("linked");symlink(&shared,&linked).unwrap();
+    for root in [&shared,&linked] {
+        let result=Command::new(env!("CARGO_BIN_EXE_serverq")).args(["rules","--home"]).arg(root).output().unwrap();
+        assert!(result.status.success());
+        assert!(String::from_utf8_lossy(&result.stderr).contains("telemetry unknown"));
+        assert_eq!(fs::metadata(&shared).unwrap().permissions().mode()&0o777,0o755);
+        assert!(!shared.join("telemetry.db").exists());
+    }
     fs::remove_dir_all(home).unwrap();
 }

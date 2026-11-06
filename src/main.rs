@@ -100,7 +100,26 @@ fn run(args: &[String]) -> Result<i32, String> {
         ["service", _] => "cli.service".into(),
         _ => "cli.other".into(),
     };
+    // Unit fixtures use scoped stores; executable paths install one process collector.
+    let runtime = (!cfg!(test) && words != ["selftest"]).then(|| telemetry::start_capture(&t.install)).flatten();
+    let command = match words.as_slice() {
+        ["check"]=>"check", ["inspect"]=>"inspect", ["import",_]=>"import", ["rules"]=>"rules",
+        ["projection"]=>"projection", ["enroll",_]=>"enroll", ["connection","status"]=>"connection",
+        ["disconnect"]=>"disconnect", ["doctor"]=>"doctor", ["update"]=>"update", ["rollback"]=>"rollback",
+        ["profile"]=>"profile", ["inventory-worker",_]=>"inventory-worker", ["service","run"]=>"service-run",
+        ["service",_]=>"service", ["selftest"]=>"selftest", _=>"other",
+    };
+    let span=tracing::info_span!("cli",coreq_operation=command,coreq_result="unclassified",coreq_error=tracing::field::Empty);
+    let entered=span.enter();
     let result = parsed.and_then(|()| dispatch(&t, &words, &filesystem, force, headless));
+    match &result {
+        Err(e)=>{span.record("coreq_error",profile::class(e));},
+        Ok(2)=>{span.record("coreq_error","unknown-result");},
+        Ok(1)=>{span.record("coreq_error","check-warning");},
+        _=>{},
+    }
+    span.record("coreq_result","observed");
+    drop(entered);drop(span);
     if op.is_empty() {
         profile::discard();
     } else {
@@ -112,6 +131,7 @@ fn run(args: &[String]) -> Result<i32, String> {
         profile::record(&op, start, error);
         profile::flush(&t.install);
     }
+    drop(runtime);
     result
 }
 
@@ -203,7 +223,10 @@ fn selftest() -> Result<i32, String> {
     // a fresh 0700 folder: an existing path or a planted link fails instead of being written through
     fs::DirBuilder::new().mode(0o700).create(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     fs::write(dir.join("inventory.json"),"[]").map_err(|e|e.to_string())?;
-    let result = check(&dir, "/", true, &mut telemetry::Checks::default());
+    let runtime=(!cfg!(test)).then(||telemetry::start_capture(&dir)).flatten();
+    let result = coreq::telemetry::capture::operation("selftest",||check(&dir, "/", true, &mut telemetry::Checks::default()),|e|profile::class(e))
+        .and_then(|result| {if !cfg!(test) {coreq::telemetry::capture::qualify()?;} Ok(result)});
+    drop(runtime);
     let _ = fs::remove_dir_all(&dir);
     let (code, report) = result?;
     let missing: Vec<&String> = rules.iter().filter(|(k, r)| r["manual"] != true && report["results"].get(k.as_str()).is_none()).map(|(k, _)| k).collect();
@@ -506,7 +529,6 @@ fn serve(t: &coreq::Tool) -> Result<i32, String> {
     let mut telemetry_backoff = coreq::enroll::Backoff::default();
     let mut next_telemetry = None;
     let mut next_resource=Instant::now();
-    telemetry.start_resources(&t.install)?;
     let (mut check_status, mut update_at, mut check_error, mut update_error): (Value, Value, Option<String>, Option<String>) = (Value::Null, Value::Null, None, None);
     let mut need_error = None;
     // the launcher runs `releases/<ver>/serverq`; a first completed check marks that release healthy
@@ -517,6 +539,8 @@ fn serve(t: &coreq::Tool) -> Result<i32, String> {
         let resource_at = next_resource;
         let wake = [Some(next), Some(resource_at), next_send, next_telemetry].into_iter().flatten().min().unwrap();
         std::thread::sleep(wake.saturating_duration_since(Instant::now()));
+        let pass=tracing::info_span!("service.pass",coreq_result="unclassified",coreq_error=tracing::field::Empty);
+        let _pass=pass.enter();
         let paused = t.install.join("paused").exists();
         let mut checked = false;
         // a delivery retry wakes the loop before the next check or update without running either
@@ -526,7 +550,7 @@ fn serve(t: &coreq::Tool) -> Result<i32, String> {
         }
         if !retry && Instant::now() >= next_check {
             let start = Instant::now();
-            let result = check(&t.install, "/", false, &mut telemetry);
+            let result = coreq::telemetry::capture::operation("service.check",||check(&t.install, "/", false, &mut telemetry),|e|profile::class(e));
             let error = match &result {
                 Err(e) => Some(profile::class(e)),
                 Ok((2, _)) => Some("unknown-result"),
@@ -564,15 +588,17 @@ fn serve(t: &coreq::Tool) -> Result<i32, String> {
                 println!("serverq: {e}");
             }
             if paused {
+                let _refused=tracing::info_span!("operation",coreq_operation="service.update",coreq_refusal="paused",coreq_result="observed").entered();
                 println!("serverq: update paused");
             } else {
                 let start = Instant::now();
-                let result = update(t);
+                let result = coreq::telemetry::capture::operation("service.update",||update(t),|e|profile::class(e));
                 profile::record("service.update", start, result.as_ref().err().map(|e| profile::class(e)));
                 profile::flush(&t.install);
                 match result {
                     Ok(Some(v)) => {
                         println!("serverq: updated to {v}; restarting");
+                        pass.record("coreq_result","observed");
                         return Ok(75);
                     }
                     Ok(None) => {
@@ -601,6 +627,8 @@ fn serve(t: &coreq::Tool) -> Result<i32, String> {
         s["update_at"] = update_at.clone();
         s["paused"] = t.install.join("paused").exists().into();
         coreq::write_atomic(&t.install.join("status.json"), &pretty(&s))?;
+        if !error.is_empty() {pass.record("coreq_error","service-errors");}
+        pass.record("coreq_result","observed");
     }
 }
 
@@ -664,6 +692,9 @@ fn queue(home: &Path, dir: &Path) -> Result<Value, String> {
 
 /// One delivery try of `snapshot.json`: `accepted` moves it to `sent.json`, `rejected` ends it; `Ok(Some(secs))` retries.
 fn send(dir: &Path, backoff: &mut coreq::enroll::Backoff, wire: &mut dyn coreq::enroll::Wire) -> Result<Option<u64>, String> {
+    let span=tracing::info_span!("delivery.snapshot",coreq_result="unclassified",coreq_error=tracing::field::Empty);
+    let _entered=span.enter();
+    let result=(|| {
     let p = dir.join("snapshot.json");
     let r: Value = serde_json::from_slice(&fs::read(&p).map_err(|e| format!("{}: {e}", p.display()))?).map_err(|_| format!("invalid {}", p.display()))?;
     match coreq::enroll::deliver(dir, std::slice::from_ref(&r), backoff, wire) {
@@ -675,6 +706,17 @@ fn send(dir: &Path, backoff: &mut coreq::enroll::Backoff, wire: &mut dyn coreq::
         Err(coreq::enroll::Delivery::Retry(s)) => Ok(Some(s)),
         Err(coreq::enroll::Delivery::Stopped(e)) => Err(e),
     }
+    })();
+    match &result {
+        Ok(Some(seconds))=>{
+            span.record("coreq_error","delivery-retry");
+            if let Some(home)=dir.parent() {telemetry::Checks::default().retry(home,"snapshot",*seconds);}
+        },
+        Err(e)=>{span.record("coreq_error",profile::class(e));},
+        _=>{},
+    }
+    span.record("coreq_result","observed");
+    result
 }
 
 /// The service's connection step: revoke retries, then, with an active grant, a fresh snapshot after a check and its
@@ -1687,6 +1729,10 @@ mod tests {
         assert!(telemetry.ship(&home, &mut backoff, &mut dash).is_some());
         dash.online = true;
         assert_eq!(telemetry.ship(&home, &mut backoff, &mut dash), None);
+        let retry=dash.events.iter().map(|e|&e.2["payload"]["observation"])
+            .find(|o|o["operation"]=="delivery.retry").expect("retry scheduling must remain distinct from a failed attempt");
+        assert_eq!(retry["outcome"],"retried");assert_eq!(retry["error"],"delivery-retry");
+        assert_eq!(retry["source"],"observation");assert!(retry["units"].as_u64().unwrap()>=1);
         let observations: Vec<_> = dash.events.iter().filter(|e| e.2["schema"] == coreq::telemetry::OBSERVATION_SCHEMA && e.2["payload"]["observation"]["kind"] == "check").collect();
         assert_eq!(observations.len(), report["results"].as_object().unwrap().len());
         for (_, _, r) in observations {
