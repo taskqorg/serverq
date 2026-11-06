@@ -844,3 +844,35 @@ fn capture_refuses_an_unsafe_root_without_changing_it() {
     }
     fs::remove_dir_all(home).unwrap();
 }
+
+// A fresh daemon may start while the installer validates the same bounded store.
+// Startup must wait for transient budget contention instead of running forever without capture.
+#[test]
+fn startup_recovers_from_a_busy_telemetry_budget() {
+    use std::{io::{BufRead,BufReader},sync::mpsc,time::{Duration,Instant}};
+    let home=scratch("capture-budget");
+    let held=coreq::file_lock::try_lock(&home.join("telemetry.budget.lock")).unwrap();
+    let mut child=Command::new(env!("CARGO_BIN_EXE_serverq")).args(["rules","--home"]).arg(&home)
+        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+    let stderr=child.stderr.take().unwrap();let (send,receive)=mpsc::channel();
+    let reader=std::thread::spawn(move||for line in BufReader::new(stderr).lines() {if send.send(line.unwrap()).is_err(){break;}});
+    let first=receive.recv_timeout(Duration::from_secs(15)).unwrap();
+    assert_eq!(first,"serverq: telemetry waiting: installation-budget-lock");
+    assert!(child.try_wait().unwrap().is_none(),"command ran without a collector while startup was blocked");
+    drop(held);
+    let until=Instant::now()+Duration::from_secs(30);
+    let status=loop {
+        if let Some(status)=child.try_wait().unwrap(){break status;}
+        if Instant::now()>=until {child.kill().unwrap();let _=child.wait();panic!("collector did not recover after lock release");}
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    reader.join().unwrap();assert!(status.success());
+    let store=coreq::telemetry::Store::open(&home.join("telemetry.db")).unwrap();
+    let rows=store.export(0,0,100).unwrap();
+    let retry=rows["events"].as_array().unwrap().iter().map(|r|&r["observation"])
+        .find(|o|o["operation"]=="telemetry.bootstrap").expect("recovered startup must retain its instability");
+    assert_eq!(retry["outcome"],"retried");assert_eq!(retry["error"],"installation-budget-lock");
+    assert!(retry["calls"].as_u64().unwrap()>=2);
+    assert!(rows["events"].as_array().unwrap().iter().any(|r|r["observation"]["operation"]=="serverq.cli.rules"&&r["observation"]["kind"]=="method"));
+    drop(store);fs::remove_dir_all(home).unwrap();
+}
