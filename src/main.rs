@@ -472,9 +472,9 @@ fn end(t: &coreq::Tool) -> Result<(), String> {
                 Err(e)=>return Err(format!("launchctl bootout: {e}")),
             }
             loop {
-                let (loaded,_)=mac_state(&c[2],until)?;
-                let exited=match &old {Some(old)=>coreq::process::identity(old.pid).map_err(|_|"native process identity unavailable")?.as_ref()!=Some(old),None=>true};
-                if !loaded && exited {return Ok(());}
+                let absent=matches!(mac_state(&c[2],until),Ok((false,_)));
+                let exited=match &old {Some(old)=>coreq::process::identity(old.pid).is_ok_and(|current|current.as_ref()!=Some(old)),None=>true};
+                if absent && exited {return Ok(());}
                 if Instant::now()>=until {return Err("native stop timeout; process exit unconfirmed".into());}
                 std::thread::sleep(Duration::from_millis(100).min(until.saturating_duration_since(Instant::now())));
             }
@@ -511,7 +511,7 @@ fn end(t: &coreq::Tool) -> Result<(), String> {
                 Err(_)=>return Err("native process termination unconfirmed".into()),
             }
             loop {
-                if coreq::process::identity(target.pid).map_err(|_|"native process identity unavailable")?.as_ref()!=Some(target) {return Ok(());}
+                if coreq::process::identity(target.pid).is_ok_and(|current|current.as_ref()!=Some(target)) {return Ok(());}
                 if Instant::now()>=until {return Err("native stop timeout; exit unconfirmed".into());}
                 std::thread::sleep(Duration::from_millis(100).min(until.saturating_duration_since(Instant::now())));
             }
@@ -939,7 +939,7 @@ fn service_status(t: &coreq::Tool) -> Result<i32, String> {
 }
 
 /// Exclusive `<home>/lock`; a busy lock is an error, never a skipped audit.
-fn lock(home: &Path, what: &str) -> Result<File, String> {
+fn lock(home: &Path, what: &str) -> Result<coreq::file_lock::Lock, String> {
     let e = |e: std::io::Error| format!("{}: {e}", home.display());
     fs::DirBuilder::new().recursive(true).mode(0o700).create(home).map_err(e)?;
     private(home, 0o700).map_err(e)?;
@@ -947,20 +947,10 @@ fn lock(home: &Path, what: &str) -> Result<File, String> {
     // write, not append: Windows locks only a handle with write access
     let f = OpenOptions::new().write(true).create(true).truncate(false).mode(0o600).open(&p).map_err(e)?;
     private(&p, 0o600).map_err(e)?;
-    // a child spawned by another thread holds a copy of a just-closed lock until its exec; wait that out, not a running serverq
-    let mut r = f.try_lock();
-    for _ in 0..5 {
-        if !matches!(r, Err(fs::TryLockError::WouldBlock)) {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        r = f.try_lock();
-    }
-    r.map_err(|err| match err {
+    coreq::file_lock::try_lock_file(f).map_err(|err| match err {
         fs::TryLockError::WouldBlock => format!("serverq is already running; {what} was not started"),
         fs::TryLockError::Error(err) => format!("{}: {err}", p.display()),
-    })?;
-    Ok(f)
+    })
 }
 
 fn audit(home: &Path, filesystem: &str, force: bool, telemetry: &mut telemetry::Checks) -> Result<Value, String> {
@@ -1434,6 +1424,19 @@ mod tests {
 
     fn status(v: &Value) -> &str {
         v["status"].as_str().unwrap()
+    }
+
+    // A parallel fork can retain a descriptor after enrollment returns; only explicit unlock retires ownership.
+    #[cfg(unix)]
+    #[test]
+    fn inherited_descriptor_cannot_keep_a_finished_operation_locked() {
+        let home=scratch("owned-lock");
+        let held=lock(&home,"fixture").unwrap();
+        let inherited=held.file().try_clone().unwrap();
+        assert!(lock(&home,"competing").is_err(),"a live owner must still exclude work");
+        drop(held);
+        let next=lock(&home,"next").expect("finished operation retained a fork-inherited lock");
+        drop(next);drop(inherited);fs::remove_dir_all(home).unwrap();
     }
 
     #[test]
