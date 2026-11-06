@@ -58,7 +58,7 @@ pub fn bounded(home:&Path,status:&str)->Value {
         let _=std::io::Write::write_all(&mut std::io::stderr(),&output.stderr);
         serde_json::from_slice(&output.stdout).map_err(|_|"invalid-worker-sample")
     })();
-    result.unwrap_or_else(|reason| json!({"trace":crate::sha256(format!("{}",crate::now()).as_bytes())[..32],"at_ms":(crate::now()*1000.0) as u64,"duration_us":null,"entities":[],"collections":{"inventory":{"status":"unknown","reason":reason,"count":null}},"scan":{"status":"unknown","reason":reason,"cpu_us":null,"duration_us":null}}))
+    result.unwrap_or_else(|reason| json!({"host":crate::hostname(),"trace":crate::sha256(format!("{}",crate::now()).as_bytes())[..32],"at_ms":(crate::now()*1000.0) as u64,"duration_us":null,"entities":[],"collections":{"inventory":{"status":"unknown","reason":reason,"count":null}},"scan":{"status":"unknown","reason":reason,"cpu_us":null,"duration_us":null}}))
 }
 
 pub fn collect(home: &Path, status: &str) -> Value {
@@ -740,6 +740,20 @@ fn cpu_us() -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// R1/diagnostic import: worker failure retains identity without fabricating inventory.
+    #[test]
+    fn failed_worker_retains_host_for_diagnostic_import() {
+        let home=crate::tests::scratch("inventory-failed-worker");
+        // The test executable rejects the worker arguments, exercising the real failure path.
+        let sample=bounded(&home,"unknown");
+        assert_eq!(sample["host"],crate::hostname());
+        assert_eq!(sample["collections"]["inventory"]["status"],"unknown");
+        assert_eq!(sample["scan"]["status"],"unknown");
+        assert!(sample["at_ms"].is_u64());
+        assert!(sample["entities"].as_array().unwrap().is_empty());
+        fs::remove_dir_all(home).unwrap();
+    }
 
     /// A4/R1: metadata totals, top/depth bounds, links and exhausted scans never fabricate a complete total.
     #[test]
