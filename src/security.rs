@@ -41,6 +41,7 @@ fn classify(text:&str)->(&'static str,&'static str) {
     let is=|key:&str,value:&str|fields.get(key)==Some(&value);
     if is("glibc","1")&&is("musl","0") {return ("not-affected","glibc");}
     if is("fixed","1") {return ("not-affected","upstream-fix-present");}
+    if is("sshd","0") {return ("unknown","sshd-not-found-in-probe-scope");}
     let conditional=is("conditional","1")||is("conditional","2");
     if is("musl","1")&&is("sshd","1")&&is("password","1")&&is("pam","0")&&is("stars","1")&&is("hashes","1") {
         return ("potentially-affected",if conditional {"default-conditions-present-context-unverified"}else{"exposure-conditions-present-fix-unverified"});
@@ -95,6 +96,7 @@ mod tests {
         assert_eq!(classify(&exposed.replace("conditional=0","conditional=1")).0,"potentially-affected");
         assert_eq!(classify(&exposed.replace("conditional=0","conditional=1").replace("password=1","password=0")).0,"unknown");
         assert_eq!(classify(&exposed.replace("stars=1","stars=2")).0,"unknown");
+        assert_eq!(classify(&exposed.replace("sshd=1","sshd=0").replace("conditional=0","conditional=2")),("unknown","sshd-not-found-in-probe-scope"));
         assert_eq!(classify(&(exposed.to_owned()+"password=0\n")).0,"unknown");
         assert_eq!(classify("invented-secret").0,"unknown");
     }
