@@ -11,13 +11,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod profile;
 mod inventory;
+mod discovery;
+mod security;
 mod telemetry;
 mod time;
 
 const RULES: &[u8] = include_bytes!("../rules.json");
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DOCKER: [&str; 3] = ["docker", "--host", "unix:///var/run/docker.sock"];
-const USAGE: &str = "usage: serverq check [--force] [--filesystem PATH] | rules | projection | enroll URL [--headless] | connection status | disconnect | profile | doctor | update | rollback | selftest | service install|run|pause|resume|status|restart|stop|uninstall; every command takes --home PATH";
+const USAGE: &str = "usage: serverq check [--force] [--filesystem PATH] | inspect | import FILE | rules | projection | enroll URL [--headless] | connection status | disconnect | profile | doctor | update | rollback | selftest | service install|run|pause|resume|status|restart|stop|uninstall; every command takes --home PATH";
 const UNIT: &str = "serverq.service";
 const LINUX: bool = cfg!(target_os = "linux");
 const UNSUPPORTED: &str = "unsupported-os";
@@ -94,7 +96,7 @@ fn run(args: &[String]) -> Result<i32, String> {
     let op = match words[..] {
         _ if parsed.is_err() => "cli.other".into(),
         [w @ ("check" | "rules" | "projection" | "update" | "rollback")] => format!("cli.{w}"),
-        ["selftest" | "profile" | "doctor" | "disconnect"] | ["enroll", _] | ["connection", "status"] | ["service", "run"] => String::new(),
+        ["inventory-worker", _] | ["selftest" | "profile" | "doctor" | "disconnect"] | ["enroll", _] | ["connection", "status"] | ["service", "run"] => String::new(),
         ["service", _] => "cli.service".into(),
         _ => "cli.other".into(),
     };
@@ -120,6 +122,33 @@ fn dispatch(t: &coreq::Tool, words: &[&str], filesystem: &str, force: bool, head
             println!("{}", pretty(&report));
             Ok(code)
         }
+        ["inventory-worker", status @ ("ok" | "warn" | "unknown")] => {
+            println!("{}", pretty(&inventory::collect(&t.install, status)));
+            Ok(0)
+        }
+        ["inspect"] => {
+            let mut sample = inventory::bounded(&t.install, "unknown");
+            security::collect(&mut sample);
+            sample["source"]="ssh-diagnostic".into();
+            println!("{}", pretty(&sample));
+            Ok(0)
+        }
+        ["import", file] => {
+            let _held=lock(&t.install,"import")?;
+            let mut bytes = Vec::new();
+            File::open(file).map_err(|e| e.to_string())?.take((1 << 20) + 1).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+            if bytes.len() > 1 << 20 { return Err("diagnostic sample exceeds 1 MiB".into()); }
+            let sample: Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+            if sample["host"]!=hostname() {return Err("diagnostic host does not match this installation".into());}
+            let at = sample["at_ms"].as_u64().filter(|at| *at <= (now()*1000.0) as u64).ok_or("missing or future producer time")?;
+            let entities=sample["entities"].as_array().ok_or("missing entities")?;
+            for row in entities {
+                coreq::telemetry::Event::observation(json!({"product":"serverq","version":VERSION,"kind":"inventory","operation":"inventory.sample","started_ms":at,"trace":sample["trace"],"span":null,"unknown":{"span":"no-caller"},"outcome":"ok","error":"none","inventory":row}))?;
+            }
+            let result=telemetry::Checks::default().inventory(&t.install,&sample);
+            println!("{}",pretty(&result));
+            Ok(if result["status"]=="ok" {0} else {2})
+        }
         ["rules"] => {
             std::io::stdout().write_all(RULES).map_err(|e| e.to_string())?;
             Ok(0)
@@ -142,7 +171,10 @@ fn dispatch(t: &coreq::Tool, words: &[&str], filesystem: &str, force: bool, head
         ["update"] => {
             print_unmet();
             match update(t)? {
-                Some(v) => println!("serverq: updated to {v}"),
+                Some(v) => {
+                    if installed(t)? {restart(t)?;}
+                    println!("serverq: updated to {v}");
+                },
                 None => println!("serverq: up to date"),
             }
             Ok(0)
@@ -170,6 +202,7 @@ fn selftest() -> Result<i32, String> {
     let dir = std::env::temp_dir().join(format!("serverq-selftest-{}-{nanos}", std::process::id()));
     // a fresh 0700 folder: an existing path or a planted link fails instead of being written through
     fs::DirBuilder::new().mode(0o700).create(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    fs::write(dir.join("inventory.json"),"[]").map_err(|e|e.to_string())?;
     let result = check(&dir, "/", true, &mut telemetry::Checks::default());
     let _ = fs::remove_dir_all(&dir);
     let (code, report) = result?;
@@ -183,7 +216,7 @@ fn selftest() -> Result<i32, String> {
 
 /// One external tool of this OS (serverq.md § 6): name, minimum version (empty: shipped with the OS, presence only), what needs it.
 fn needs() -> Vec<(&'static str, &'static str, &'static str)> {
-    let mut v = vec![("curl", "7.20.2", "update, enroll, delivery")];
+    let mut v = vec![("curl", "7.20.2", "update, enroll, delivery"), ("gh", "2.49.0", "trusted updates")];
     if LINUX {
         v.extend([("systemctl", "239", "failed-services, service"), ("systemd-analyze", "239", "bounded-journal")]);
         if Path::new("/var/run/docker.sock").exists() {
@@ -202,6 +235,7 @@ fn fix(tool: &str, min: &str) -> String {
     match tool {
         _ if min.is_empty() => format!("restore {tool}, which ships with {}", std::env::consts::OS),
         "systemctl" | "systemd-analyze" => format!("upgrade the OS to a release with systemd {min} or newer"),
+        "gh" => format!("install GitHub CLI {min} or newer from https://cli.github.com; required for release attestation verification"),
         "docker" => format!("install or upgrade the Docker CLI package (docker-ce-cli or docker.io) to {min} or newer"),
         _ if cfg!(windows) => format!("put {tool}.exe {min} or newer on PATH (it ships with Windows 10 1803 and later)"),
         _ => format!("install or upgrade the OS {tool} package to {min} or newer"),
@@ -288,6 +322,7 @@ fn service(t: &coreq::Tool, cmd: &str) -> Result<i32, String> {
             return Err("the LaunchAgent uses the default install folder; drop --home and SERVERQ_INSTALL".into());
         }
     }
+    if LINUX&&matches!(cmd,"restart"|"stop"|"uninstall") {installed(t)?;}
     let _held = if matches!(cmd, "restart" | "stop" | "uninstall") { Some(lock(&t.install, cmd)?) } else { None };
     let paused = t.install.join("paused");
     match cmd {
@@ -407,21 +442,39 @@ fn unit(t: &coreq::Tool) -> coreq::service::Unit {
     }
 }
 
+/// The host unit cannot be reused by a different --home installation.
+fn installed(t:&coreq::Tool)->Result<bool,String> {
+    let unit=unit(t);
+    if !LINUX {
+        if cfg!(target_os="macos") && unit.path.exists() {
+            let default=PathBuf::from(std::env::var_os("HOME").ok_or("HOME is not set")?).join(".local/share/serverq");
+            if t.install!=default {return Err("existing LaunchAgent belongs to the default installation; active files kept".into());}
+        }
+        return Ok(unit.path.exists());
+    }
+    let text=match fs::read_to_string(&unit.path) {Ok(text)=>text,Err(e) if e.kind()==std::io::ErrorKind::NotFound=>return Ok(false),Err(e)=>return Err(format!("existing unit unreadable: {e}"))};
+    let expected=format!("ExecStart=\"{}/serverq\" service run --home \"{}\"",t.install.display(),t.install.display());
+    if !text.lines().any(|line|line==expected) {return Err("existing ServerQ unit belongs to another installation; active files and native unit kept".into());}
+    Ok(true)
+}
+
 /// Install one prepared binary, activate it, then register the native unit (serverq.md § 5).
 fn install(t: &coreq::Tool) -> Result<i32, String> {
     if cfg!(windows) && t.install != coreq::Tool::new("serverq", "ServerQ", "taskqorg/serverq", VERSION).install {
         return Err("the Scheduled Task uses the default install folder; drop --home".into());
     }
     let held = lock(&t.install, "install")?;
+    let replacing=installed(t)?;
+    let u=unit(t);
     let bytes = fs::read(std::env::current_exe().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
     coreq::update::prepare_install(t, &bytes)?;
     coreq::update::activate_install(t).map_err(|e| format!("activation uncertain; inspect current and the native service before retrying: {e}"))?;
     if cfg!(windows) || cfg!(target_os = "macos") {
         end(t)?;
     }
-    let u = unit(t);
     coreq::service::write_unit(&u)?;
     coreq::service::run_all(&u.load, false)?;
+    if LINUX&&replacing {restart(t)?;}
     println!("installed serverq {VERSION}; started {}", u.path.display());
     drop(held);
     let (code, _) = check(&t.install, "/", false, &mut telemetry::Checks::default())?;
@@ -433,7 +486,8 @@ fn install(t: &coreq::Tool) -> Result<i32, String> {
 /// Install and both update entry points share the audit lock, so releases cannot change concurrently.
 fn update(t: &coreq::Tool) -> Result<Option<String>, String> {
     let _held = lock(&t.install, "update")?;
-    coreq::update::update(t, false)
+    installed(t)?;
+    coreq::update::update_attested(t, false)
 }
 
 fn every(var: &str, default: u64) -> Duration {
@@ -451,6 +505,8 @@ fn serve(t: &coreq::Tool) -> Result<i32, String> {
     let mut telemetry = telemetry::Checks::default();
     let mut telemetry_backoff = coreq::enroll::Backoff::default();
     let mut next_telemetry = None;
+    let mut next_resource=Instant::now();
+    telemetry.start_resources(&t.install)?;
     let (mut check_status, mut update_at, mut check_error, mut update_error): (Value, Value, Option<String>, Option<String>) = (Value::Null, Value::Null, None, None);
     let mut need_error = None;
     // the launcher runs `releases/<ver>/serverq`; a first completed check marks that release healthy
@@ -458,14 +514,18 @@ fn serve(t: &coreq::Tool) -> Result<i32, String> {
     println!("serverq {VERSION}: service started");
     loop {
         let next = next_check.min(next_update);
-        let wake = [Some(next), next_send, next_telemetry].into_iter().flatten().min().unwrap();
+        let resource_at = next_resource;
+        let wake = [Some(next), Some(resource_at), next_send, next_telemetry].into_iter().flatten().min().unwrap();
         std::thread::sleep(wake.saturating_duration_since(Instant::now()));
         let paused = t.install.join("paused").exists();
         let mut checked = false;
         // a delivery retry wakes the loop before the next check or update without running either
         let retry = wake < next;
+        if Instant::now() >= next_resource {
+            next_resource=Instant::now()+Duration::from_secs(30);
+        }
         if !retry && Instant::now() >= next_check {
-            next_check += check_every;
+            next_check = Instant::now()+check_every;
             let start = Instant::now();
             let result = check(&t.install, "/", false, &mut telemetry);
             let error = match &result {
@@ -497,7 +557,7 @@ fn serve(t: &coreq::Tool) -> Result<i32, String> {
                 }
             }
         } else if !retry {
-            next_update += update_every;
+            next_update = Instant::now()+update_every;
             update_at = (now() as u64).into();
             let unmet = unmet();
             need_error = (!unmet.is_empty()).then(|| format!("requirements: {}", unmet.join("; ")));
@@ -818,7 +878,7 @@ fn audit(home: &Path, filesystem: &str, force: bool, telemetry: &mut telemetry::
     incidents(&mut state, &results, now)?;
     let manual: Vec<&String> = rules.iter().filter(|(_, r)| r["manual"] == true).map(|(k, _)| k).collect();
     let status = if results.values().any(|r| r["status"] == "unknown") { "unknown" } else if results.values().any(|r| r["status"] == "warn") { "warn" } else { "ok" };
-    let mut inventory = inventory::collect(home, status);
+    let mut inventory = inventory::bounded(home, status);
     inventory["telemetry"] = telemetry.inventory(home, &inventory);
     let report = json!({"schema": 1, "at": now, "revision": revision, "catalog": sha256(RULES), "filesystem": filesystem, "results": results, "inventory": inventory,
         "incidents": state.get("incidents").cloned().unwrap_or(json!({})), "manual_rules": manual});
@@ -966,45 +1026,21 @@ fn command(argv: &[&str]) -> Result<String, String> {
     r
 }
 
-/// Reads a child's pipe to its end on its own thread.
-fn drain(mut pipe: impl Read + Send + 'static) -> std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>> {
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = tx.send(pipe.read_to_end(&mut buf).map(|_| buf));
-    });
-    rx
-}
-
-/// Runs without a shell, 15 s timeout; spawn failure, nonzero exit or timeout is an error naming the command (serverq.md § 3).
+/// Shared bounded execution: stdout/stderr and the direct child retain one finite owner.
 fn run_probe(argv: &[&str]) -> Result<String, String> {
-    let shown: String = argv.join(" ").chars().take(200).collect();
-    let fail = |why: String| format!("`{shown}` collection failed: {why}");
-    let mut child = Command::new(argv[0]).args(&argv[1..]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|e| fail(format!("{:?}", e.kind())))?;
-    let rx = drain(child.stdout.take().ok_or_else(|| fail("no stdout".into()))?);
-    let err = drain(child.stderr.take().ok_or_else(|| fail("no stderr".into()))?);
-    let deadline = Instant::now() + Duration::from_secs(15);
-    let status = loop {
-        match child.try_wait().map_err(|e| fail(format!("{:?}", e.kind())))? {
-            Some(s) => break s,
-            None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
-            None => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(fail("timeout".into()));
-            }
+    let shown: String=argv.join(" ").chars().take(200).collect();
+    let fail=|why:String|format!("`{shown}` collection failed: {why}");
+    let output=coreq::process::output("probe.command",Command::new(argv[0]).args(&argv[1..]),Duration::from_secs(15));
+    match output {
+        Ok(out)=>String::from_utf8(out.stdout).map_err(|_|fail("invalid UTF-8".into())),
+        Err(coreq::process::Failure::Exit(out))=>{
+            let detail:String=String::from_utf8_lossy(&out.stderr).split_whitespace().collect::<Vec<_>>().join(" ").chars().take(300).collect();
+            let code=out.status.code().map_or("signal".into(),|c|format!("exit {c}"));
+            Err(fail(if detail.is_empty(){code}else{format!("{code}: {detail}")}))
         }
-    };
-    // a grandchild holding the pipe open must not outlive the deadline either
-    let left = deadline.saturating_duration_since(Instant::now());
-    if !status.success() {
-        let stderr = err.recv_timeout(left).ok().and_then(Result::ok).unwrap_or_default();
-        let stderr: String = String::from_utf8_lossy(&stderr).split_whitespace().collect::<Vec<_>>().join(" ").chars().take(300).collect();
-        let code = status.code().map_or("signal".into(), |c| format!("exit {c}"));
-        return Err(fail(if stderr.is_empty() { code } else { format!("{code}: {stderr}") }));
+        Err(coreq::process::Failure::Spawn(e))=>Err(fail(format!("{:?}",e.kind()))),
+        Err(e)=>Err(fail(e.to_string())),
     }
-    let buf = rx.recv_timeout(left).map_err(|_| fail("timeout".into()))?.map_err(|e| fail(format!("{:?}", e.kind())))?;
-    String::from_utf8(buf).map_err(|_| fail("invalid UTF-8".into()))
 }
 
 /// An executable `name` on PATH, as `Command` finds it.

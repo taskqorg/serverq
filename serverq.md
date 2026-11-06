@@ -3,7 +3,7 @@
 serverq checks server-care rules and reports read-only host, workload and disk inventory to agents and monitors. It never repairs a server, takes commands, runs AI or promises uptime (R2, R3, R8).
 
 This file is the whole contract of **v1**, the Rust binary built on [coreq](https://github.com/taskqorg/coreq). It follows the [specq release contract](https://github.com/taskqorg/specq/blob/main/engineering/release-contract.md); coreq.md holds the shared update, launcher, service and `status.json` detail.
-The runtime uses coreq v0.22.0, pinned to commit `c02513fd4b7d296c075a91b08c2e9ad16b0726aa`.
+The runtime uses CoreQ v0.23.1, pinned to `af362ba73c88d2f7118efe45b6f9605ea5593c97`, with bounded output, attested updates and R56 self-resource observations.
 
 ## 1. Principles
 
@@ -14,7 +14,8 @@ The runtime uses coreq v0.22.0, pinned to commit `c02513fd4b7d296c075a91b08c2e9a
 - **R5 Manual rules stay manual.** A rule with `manual: true` is listed, never claimed as automatically verified. Exit 0 never certifies manual rules.
 - **R6 Dynamic checks every time.** Capacity and service checks run on every pass. Only configuration checks are cached (§ 3).
 - **R7 Compatible reports.** Exit codes and the report schema are those of the Python serverq; a monitor reading either keeps working. A release changes `report.json` and `state.json` only additively (N/N-1); a new schema number needs a cutover task.
-- **R8 Scope.** Read-only status, resources, services, containers, project roots and disk use are in scope. AI analysis belongs to consumers. serverq promises no uptime, security compliance, backup restoration or application monitoring, and adds no unattended git pull, cleanup, self-improvement loop or remote execution.
+- **R8 Scope.** Read-only status, resources, services, containers, sites, folders, observed links and disk use are in scope. Projects are optional interpretations, never required configuration.
+- AI analysis belongs to consumers. serverq promises no uptime, security compliance, backup restoration or application monitoring, and adds no unattended git pull, cleanup, self-improvement loop or remote execution.
 - **R9 Canonical server-care principles.** A server maintenance task that establishes a reusable principle adds or refines it in `rules.json` with evidence, a verification method and tests. Machine-specific inventory stays private, outside this repository.
 - **R10 Spec first.** A change that alters a decision edits this file, or the linked detail that holds it (§ 12), first, in the same deliverable as the code.
 
@@ -43,7 +44,7 @@ The runtime uses coreq v0.22.0, pinned to commit `c02513fd4b7d296c075a91b08c2e9a
 
 ## 3. Check and report
 
-- **Unknown (R1).** Commands run without a shell, with a 15 s timeout; a nonzero exit or timeout is `unknown` for that rule. Its `detail` names the command (at most 200 characters) and the error: the spawn error, the exit with the first 300 characters of stderr, or the timeout.
+- **Unknown (R1).** Probes use CoreQ bounded execution without a host shell, with a 15 s timeout and 1 MiB output cap; a nonzero exit or timeout is `unknown` for that rule. Its `detail` names the command (at most 200 characters) and the error: the spawn error, the exit with the first 300 characters of stderr, or the timeout.
 - **Corrupt state (R1).** `state.json` schema 1, unchanged: `schema`, `cache`, `incidents`, `revision`, `last_run`. Another schema or unreadable JSON is an error: the file is kept for investigation, never reset.
 - **One audit at a time (R1).** An exclusive lock `<install>/lock` serializes `check` runs; a busy lock is exit 2, never a skipped audit reported as healthy.
 
@@ -81,13 +82,13 @@ coreq owns all of it; serverq passes tool name `serverq`, install folder and rel
 
 - **Verified artifacts.** Each release artifact passes `selftest` before publishing. Installers and the update keep the sha256 check.
 - Release: CI on a `v*` tag builds `serverq-<ver>-linux-<arch>` for `x86_64` and `aarch64`, `serverq-<ver>-windows-x86_64.exe` (§ 7), `serverq-<ver>-macos-aarch64` (§ 8), `SHA256SUMS` and `latest.json`.
-- Attestation: a separate job with only `id-token: write` and `attestations: write` attests each binary and `SHA256SUMS` with `actions/attest-build-provenance` (pinned by commit SHA) before the release is created.
+- Attestation: a separate job with only `id-token: write` and `attestations: write` attests each binary and `SHA256SUMS` with `actions/attest-build-provenance` (pinned by commit SHA) before the release is created. Its public `provenance.sigstore.jsonl` bundle is a release asset; hosts verify it without a GitHub token.
 - One binary (static on Linux): hosts need no Python, git or toolchain. The repository keeps version `1.0.0-dev`; the tag sets the release version, so a build from a branch is older than any release.
 - Install folder `~/.local/share/serverq` (`<install>`): immutable `releases/<ver>/`, `current`, `previous`, the launcher `<install>/serverq`, `status.json`, `paused`, plus serverq's `report.json`, `state.json`, `installation`, `lock`, `profile.json`, `trace`, `trace.jsonl`, `telemetry.db` and its CoreQ sidecars.
-- Update: coreq steps (read `latest.json`, download into `releases/<ver>.tmp/`, verify sha256, `selftest`, swap `current`). Each update prunes `releases/` to `current` and `previous`; a folder in use stays until the next update.
+- Update: coreq steps (read `latest.json`, download into `releases/<ver>.tmp/`, verify sha256 and GitHub provenance from this repository's release workflow before executing `selftest`, swap `current`). Each update prunes `releases/` to `current` and `previous`; a folder in use stays until the next update.
 - Automatic rollback: the launcher restores `previous` after three `service run` starts of a version that never wrote `releases/<ver>/healthy`; `service run` writes it after its first completed check.
 - Manual `rollback` writes `previous` into `current`, swaps them, pauses updates and restarts an installed service; `service resume` returns to normal updates. coreq never reinstalls a version whose folder exists, so a rolled-back release returns only with a newer one.
-- No own updater: coreq downloads one binary checked against `SHA256SUMS` and smoke-tests it with `selftest` before the swap; CI builds the release.
+- No own updater: CoreQ downloads one bounded binary over HTTPS, checks `SHA256SUMS` and the release-workflow attestation, and smoke-tests it with `selftest` before the swap; CI builds the release.
 - No pin (`pin.json`, `--unpin`): rollback pauses updates in coreq's service state; resume is the explicit unpin. A bad release is fixed forward by a newer one.
 - No transaction journal: switching versions is one atomic rename of `current`; releases are immutable and data lives outside them, so there is nothing to restore. No `update.json`: the update outcome goes to coreq's `status.json`.
 
@@ -100,11 +101,13 @@ One user unit, `serverq.service`, runs the checks and updates.
 - **Delivery is passive (R3).** Delivery never changes a check result, its exit or its schedule; its outcome is one journal line. No heartbeat between checks: DashQ shows the report stale by its own observation time.
 - `service install` serializes with updates, rollback and native service changes through `<install>/lock`, freezes the running binary bytes, calls coreq `prepare_install`, then `activate_install` (current release and launcher), then stops and reinstalls the native unit on Windows/macOS. Preparation failures leave the active service untouched; activation errors report uncertainty.
 - On Linux it then writes `~/.config/systemd/user/serverq.service` running `<install>/serverq service run --home <install>` with `Restart=always`, `RestartSec=10`, and loads it with `daemon-reload` and `enable --now`.
+- A matching existing unit is restarted so reinstall runs the activated release; another installation's unit is refused. Explicit `update` also restarts an installed service after a successful activation.
 - serverq has one unit per host, not one per project, so it fills coreq's `Unit` itself instead of coreq's `<name>-<project>` unit. Windows: § 7. macOS: § 8. Another OS is an error.
 - A host that must check without a login session needs `loginctl enable-linger <user>` (an operator step; serverq does not run it).
 - The unit sets these resource caps and sandbox: `UMask=0077`, `NoNewPrivileges=yes`, `PrivateTmp=yes`, `ProtectSystem=strict`, `ReadWritePaths=<install>`, `MemoryMax=128M`, `TasksMax=32`.
 - `service run` loop: a check 5 min after start, then every `check_every` (3600 s); the coreq update check 15 min after start, then every `update_every` (86400 s). Env `SERVERQ_CHECK_EVERY` and `SERVERQ_UPDATE_EVERY` (seconds) override the periods for tests; each first pass waits at most its period.
-- One loop: a check and an update never overlap. A check result 1 is a normal pass, not a service failure. An installed update exits 75 and systemd starts the new `current`. Each pass prints one line to the journal.
+- Own-process resource telemetry and delivery wake every 30 s using CoreQ R56; missing data remains unknown.
+- One loop: a check and an update never overlap. Missed periods do not create catch-up check storms. A check result 1 is a normal pass, not a service failure. An installed update exits 75 and systemd starts the new `current`. Each pass prints one line to the journal.
 - `restart`, `stop` and `uninstall` run `systemctl --user restart`, `stop` and `disable --now`; `uninstall` also deletes the unit file, never the install folder.
 - `<install>/status.json` (coreq common keys, `project` `serverq`) adds `check`: `at`, `exit`, counts per status, `report` path, and `update_at`, `paused`. `error` holds the last check, update or requirement failure (§ 6).
 - `service status` prints `Check: ok|warn|unknown <age>` and `Update: <version|up to date|paused|unknown>`. Human time follows [specq Time](https://github.com/taskqorg/specq/blob/main/caveman/rules/indicators.md#time): age first with exact UTC beside it; an unavailable time reads `? unavailable`. Retry countdowns use the same shared formatter.
@@ -124,6 +127,7 @@ serverq follows [specq host requirements](https://github.com/taskqorg/specq/blob
 | `systemctl` (systemd) | Linux | 239 | `failed-services`, `service` |
 | `systemd-analyze` (systemd) | Linux | 239 (`cat-config`) | `bounded-journal` |
 | `docker` CLI | Linux, while `/var/run/docker.sock` exists | 1.13 (`container ls`) | `bounded-docker-logs` |
+| `gh` | every OS | 2.49.0 (`attestation verify`) | trusted updates; missing verification refuses the candidate |
 | `curl` | every OS | 7.20.2 (`--proto`) | `update`, `enroll`, delivery (coreq) |
 | `launchctl`, `id`, `hostname` | macOS | shipped with the OS | `service`, host label |
 | `schtasks`, `powershell`, `whoami`, `icacls` | Windows | shipped with the OS | `service`, connection folder ACL (coreq) |
@@ -182,16 +186,28 @@ serverq follows [specq built-in profiling](https://github.com/taskqorg/specq/blo
 - Every completed audit collects one timestamped inventory sample. Its host status is the rule aggregate `ok|warn|unknown`, never a promise of uptime. An unsupported, unavailable or partial measurement is null with a stable reason (R1); a missing list is unknown, never an empty healthy list.
 - Host fields: OS and version, uptime, 1/5/15-minute load, logical CPU count and usage, total/used RAM and swap. Windows swap is unknown `unsupported-os`: commit accounting is not pagefile usage. Mounts report total, used and available bytes. CPU usage is thousandths of a logical CPU; system and process usage use two refreshes at least the platform's minimum interval apart.
 - Loaded systemd services, Windows services and this user's LaunchAgents carry status, CPU, RAM and disk usage. Linux uses systemd accounting; Windows uses process-tree CPU/RAM and shared PIDs stay unknown; macOS measures each LaunchAgent PID. Service disk is unknown without ownership proof. Container disk means its writable layer, excluding shared images and bind mounts.
-- `<install>/inventory.json` is an optional local array of absolute project-root paths, never committed here. Those exact trees define project inventory and folder scan scope; no configuration means unknown `not-configured`. Invalid configuration is preserved and reported unknown. Projects sum processes whose working directory is inside that root; missing attribution stays unknown.
+- No project manifest is required. Default roots come from local data directories, native service working directories and observed container bind mounts/volumes. The scan emits folders, not inferred projects. Existing `inventory.json` remains an explicit root override for compatibility; invalid configuration is preserved and unknown.
+- Linux process identities include PID/start time; only executable and working-directory links, never arguments or environments. Container discovery supports the local system Docker and the current user's Podman. Image, mount, process, service and site links are facts; ownership is never inferred from a similar name.
+- Site discovery reads only domain/routing fields from recognized local nginx/Caddy configuration, never emits a raw line, and marks unsupported layouts unknown. No file content or arbitrary configuration enters observations.
+- Inventory runs in a separate copy of the same binary with a 60 s deadline and bounded output; timeout produces an unknown sample without blocking the service loop. Container inventory never calls `inspect --size`; storage is measured from discovered local mounts, with shared data represented once.
 - The scan runs in a dedicated background-priority thread and reads only directory entries and metadata: no file contents, links/reparse targets or other filesystems. Directory capabilities open each component without following links. It reports the 100 largest folders through depth 4, using allocated bytes on Unix and logical bytes on Windows; hard links count once per tree.
 - A scan visits at most 100,000 entries through traversal depth 128 and takes at most 15 seconds between metadata calls. Truncation or denied access makes affected totals unknown. The report includes scope, bounds, duration, CPU time and priority outcome; telemetry records scan CPU usage without a hard CPU ceiling.
 - Linux, Windows and macOS collect native resources; unsupported fields stay unknown with reasons. macOS project CPU/RAM attribution is unsupported; it never uses Sysinfo's process reader, which reads arguments and environments. Collection never requests elevation or TCC grants, reads arguments or environments, or inspects project contents.
+- Explicit site and sshhole diagnostics may read only their documented configuration/account fields locally; no hashes or raw configuration leave the host.
 - Each entity becomes a CoreQ `kind: inventory` observation with one sample trace and its observation time. Only CoreQ R54's typed host, mount, service, container, project-root and folder identity and measurement fields leave the host; raw reports, command output and configuration never do. The check projection allowlist (§ 3) stays unchanged.
 - Collection observations carry list counts or null with their reason; the scan operation carries CPU microseconds and wall duration. An invalid entity is rejected independently and counted as loss; valid neighboring entities survive. Store failures and invalid identities are visible in the report's inventory telemetry status.
 - The existing CoreQ store and shipper (§ 9) retain successive samples under CoreQ's 30-day and physical-cap retention. Unsent samples are cursor-protected, never coalesced like snapshots. Store-full or rejected samples are reported unknown/loss; consumers compute growth only from two known measurements of the same identity and different observation times.
 - Receiver compatibility requires DashQ's typed inventory allowlist at `f9961e306dc2ecb63dbf8185e42464d24a45122d` or a descendant. This is code compatibility, not proof of production rollout.
 
-## 12. Linked detail
+## 12. Authorized diagnostics and rollout
+- `serverq inspect` is a one-shot, local administrative operation, never a remote command route. It inventories available container runtimes and checks sshhole in running containers. It never starts stopped containers, attempts a password login, installs a scanner or repairs/restarts workloads. Stopped or unreadable containers stay unknown.
+- sshhole evaluates musl, OpenSSH package/fix evidence, effective password/PAM/root settings and the presence of star/SHA-crypt account classes. Only enum results/counts leave the target, never usernames, hashes or raw files. Exposure conditions without verified patch evidence are `potentially-affected`, not a proven successful login.
+- Older unqualified distro backports stay unknown when conditions cannot be established; no vulnerable-version claim from an image name alone.
+- `serverq import FILE` validates a bounded diagnostic sample and records original producer times in this installation's observation store. It never executes supplied text, changes service authority or makes an old observation fresh. Administrative SSH is separate from the persistent service's permissions.
+- Persistent services run under the chosen non-administrative account without a new sudo or Docker grant. Privileged one-shot collection and native startup verification are operator onboarding steps; Windows/macOS retain their native account lifecycle.
+- Rollout acceptance per host: verified artifact and running version, native PID/state/restart evidence where supported, fresh local inventory/resource samples, approved connection, durable receipts and matching DashQ readback. Reinstall preserves identity/history, creates no competing owner and has a previous-release rollback.
+
+## 13. Linked detail
 
 Binding detail, loaded on demand:
 
