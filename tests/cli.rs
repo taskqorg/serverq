@@ -180,8 +180,8 @@ fn check_observations_reach_dashq_as_failed() {
     // Invented local grant; only the fake DashQ below receives it.
     fs::write(connection.join("connection.json"), serde_json::json!({"installation": "invented", "active": {
         "destination": "https://dash.example", "credential": "invented", "generation": 1}}).to_string()).unwrap();
-    // A busy native host has more than one 100-record delivery batch.
-    for at in 0..101 {
+    // A busy native host exceeds one bounded shipper pass (four 100-record batches).
+    for at in 0..501 {
         store.append(&[coreq::telemetry::Event::observation(serde_json::json!({"product":"serverq","version":"1","kind":"inventory","operation":"inventory.sample","started_ms":at,
             "trace":null,"span":null,"unknown":{"trace":"no-caller","span":"no-caller"},"outcome":"ok","error":"none","inventory":{"entity":"service","identity":"invented-pagination","status":"observed"}})).unwrap()]).unwrap();
     }
