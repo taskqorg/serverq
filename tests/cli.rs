@@ -585,7 +585,7 @@ exit 0
     // the service through the launcher: an hourly check and a daily update, each one second here
     let launcher = install.join("serverq");
     assert_eq!(run(&launcher, &["service", "status"]).status.code(), Some(2), "no status yet is unknown");
-    let mut svc = Command::new(&launcher).args(["service", "run", "--home"]).arg(&install).env("HOME", &home).env("PATH", &path).env("FAKE_RELEASE", &rel)
+    let mut svc = Command::new(&launcher).args(["service", "run", "--home"]).arg(&install).env("HOME", &home).env("PATH", &path).env("FAKE_RELEASE", &rel).env("FAKE_LOG",&log)
         .env("SERVERQ_CHECK_EVERY", "1").env("SERVERQ_UPDATE_EVERY", "1").stdout(std::process::Stdio::null()).spawn().unwrap();
     let status = install.join("status.json");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);

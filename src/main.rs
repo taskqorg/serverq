@@ -525,7 +525,6 @@ fn serve(t: &coreq::Tool) -> Result<i32, String> {
             next_resource=Instant::now()+Duration::from_secs(30);
         }
         if !retry && Instant::now() >= next_check {
-            next_check = Instant::now()+check_every;
             let start = Instant::now();
             let result = check(&t.install, "/", false, &mut telemetry);
             let error = match &result {
@@ -556,8 +555,8 @@ fn serve(t: &coreq::Tool) -> Result<i32, String> {
                     check_error = Some(format!("check: {e}"));
                 }
             }
+            next_check=Instant::now()+check_every;
         } else if !retry {
-            next_update = Instant::now()+update_every;
             update_at = (now() as u64).into();
             let unmet = unmet();
             need_error = (!unmet.is_empty()).then(|| format!("requirements: {}", unmet.join("; ")));
@@ -586,6 +585,7 @@ fn serve(t: &coreq::Tool) -> Result<i32, String> {
                     }
                 }
             }
+            next_update=Instant::now()+update_every;
         }
         profile::flush(&t.install);
         // the connection never changes a check result or the schedule; its outcome is one journal line

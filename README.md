@@ -89,7 +89,7 @@ ServerQ checks system-level failed units, not user services or application endpo
 
 ## Agent onboarding and fleet analysis
 
-Use the existing authorized SSH connection; never copy the operator's private key to a server. Check the OS, architecture, existing installation, owner and connection first. Use the same installation and identity when reinstalling. Linux servers use a dedicated non-administrative service account with linger; do not add a Docker group or sudo grant to the persistent service. On Mac/Windows use the native user's installation.
+Use the existing authorized SSH connection; never copy the operator's private key to a server. Check the OS, architecture, existing installation, owner and connection first. Use the same installation and identity when reinstalling. Linux servers use a dedicated non-administrative service account with linger. When invoking as that account from an administrative SSH session, clear `DBUS_SESSION_BUS_ADDRESS` and set `XDG_RUNTIME_DIR=/run/user/<its-uid>`; do not add a Docker group or sudo grant to the persistent service. On Mac/Windows use the native user's installation.
 
 Install GitHub CLI 2.49.0 or newer from its trusted distribution if absent. Verify SHA256 and the release-workflow attestation **before** executing the downloaded ServerQ binary. Install the native service, run `doctor` and a fresh check, and enroll through the workspace approval page. Finish only after the running version/PID, native service state, current report, connection receipt and matching DashQ data have been read back. Keep the previous release and installation data for rollback.
 
