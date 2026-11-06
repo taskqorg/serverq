@@ -3,7 +3,7 @@
 serverq checks server-care rules and reports read-only host, workload and disk inventory to agents and monitors. It never repairs a server, takes commands, runs AI or promises uptime (R2, R3, R8).
 
 This file is the whole contract of **v1**, the Rust binary built on [coreq](https://github.com/taskqorg/coreq). It follows the [specq release contract](https://github.com/taskqorg/specq/blob/main/engineering/release-contract.md); coreq.md holds the shared update, launcher, service and `status.json` detail.
-The runtime uses CoreQ v0.23.4, pinned to `68d5d5065bd9373d039fa7c5f0ee4e66f7150398`, with bounded output, attested updates and R56 self-resource observations. Capture shares the existing writer; ship passes fix their input sequence; Windows tasks use normal priority. Delivery rechecks the current grant before sending.
+The runtime uses CoreQ at the tag pinned in `Cargo.toml` and updated by Dependabot, with bounded output, attested updates and R56 self-resource observations. Capture shares the existing writer; ship passes fix their input sequence; Windows tasks use normal priority. Delivery rechecks the current grant before sending.
 
 ## 1. Principles
 
