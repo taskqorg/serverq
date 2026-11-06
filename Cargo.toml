@@ -7,7 +7,7 @@ publish = false
 [dependencies]
 cap-std = "3.4.5"
 cap-fs-ext = "3.4.5"
-coreq = { git = "https://github.com/taskqorg/coreq", rev = "eef0e59040581d5c9d6dc1306bb194ec7c4748ca" }
+coreq = { git = "https://github.com/taskqorg/coreq", rev = "68d5d5065bd9373d039fa7c5f0ee4e66f7150398" }
 libc = "0.2"
 tracing = "0.1"
 ring = "0.17"

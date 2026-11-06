@@ -205,6 +205,7 @@ fn check_observations_reach_dashq_as_failed() {
     for check in &checks {
         let o=&check["payload"]["observation"];
         assert_eq!(o["trace"],command["trace"]);assert_eq!(o["span"],command["span"]);
+        assert_eq!(o["host"],command["host"],"caller operations and checks must name the same host");
     }
     assert_eq!(checks.len(), RESULTS.len(), "inventory does not replace any rule observation");
     assert_eq!(checks.iter().map(|r| r["payload"]["observation"]["operation"].as_str().unwrap()).collect::<BTreeSet<_>>(), RESULTS.into());
@@ -299,6 +300,9 @@ fn service_status_human_time() {
     let missing = run();
     assert_eq!(missing.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&missing.stdout).contains("? unavailable"));
+    {let store=coreq::telemetry::Store::open(&home.join("telemetry.db")).unwrap();
+     assert!(store.export_kinds(&["method"],0,0,1024).unwrap()["events"].as_array().unwrap().iter()
+        .any(|r|r["observation"]["operation"]=="serverq.cli.service-status"),"native lifecycle verbs need distinct operation identities");}
     let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + 3600;
     fs::write(home.join("status.json"), serde_json::json!({"check": {"at": at, "exit": 0}}).to_string()).unwrap();
     let fresh = run();
@@ -738,12 +742,23 @@ fn macos_service_lifecycle() {
     fs::create_dir(&bin).unwrap();
     let ctl = bin.join("launchctl");
     fs::write(&ctl, r#"#!/bin/sh
-[ "$1" != list ] || { printf 'PID\tStatus\tLabel\n'; exit 0; }
+if [ "$1" = list ]; then
+ printf 'PID\tStatus\tLabel\n'
+ if [ -f "$HOME/loaded" ]; then printf -- '-\t0\tcom.serverq.serverq\n'
+ elif [ -f "$HOME/stopping" ]; then
+  n=$(cat "$HOME/stopping")
+  if [ "$n" -gt 0 ]; then echo $((n-1)) > "$HOME/stopping"; printf -- '-\t0\tcom.serverq.serverq\n'
+  else rm "$HOME/stopping"; fi
+ fi
+ exit 0
+fi
 printf '%s\n' "$*" >> "$HOME/calls"
 [ -z "$FAIL_LAUNCHCTL" ] || exit 5
 case "$1" in
-bootout) [ -f "$HOME/loaded" ] || exit 3; rm "$HOME/loaded" ;;
-bootstrap) touch "$HOME/loaded" ;;
+bootout) [ -f "$HOME/loaded" ] || exit 3; rm "$HOME/loaded"; echo 2 > "$HOME/stopping" ;;
+bootstrap) [ ! -f "$HOME/stopping" ] || { touch "$HOME/overlap"; exit 5; }
+ if [ -f "$HOME/transient" ]; then rm "$HOME/transient"; exit 5; fi
+ touch "$HOME/loaded" ;;
 *) exit 99 ;;
 esac
 "#).unwrap();
@@ -776,6 +791,16 @@ esac
         let o = run(&["service", cmd], false);
         assert_eq!(o.status.code(), Some(0), "{cmd}: {}", String::from_utf8_lossy(&o.stderr));
     }
+    assert!(!home.join("overlap").exists(),"bootstrap must wait for native stop completion");
+    fs::write(home.join("transient"),"").unwrap();
+    let retry=run(&["service","restart"],false);
+    assert!(retry.status.success(),"{}",String::from_utf8_lossy(&retry.stderr));
+    assert!(home.join("loaded").exists() && !home.join("transient").exists());
+    {let store=coreq::telemetry::Store::open(&install.join("telemetry.db")).unwrap();
+     let rows=store.export_kinds(&["operation"],0,0,1024).unwrap();
+     assert!(rows["events"].as_array().unwrap().iter().any(|r|r["observation"]["operation"]=="service.retry" && r["observation"]["outcome"]=="retried"),"successful retry must remain unstable in telemetry");
+     let methods=store.export_kinds(&["method"],0,0,1024).unwrap();
+     assert!(methods["events"].as_array().unwrap().iter().any(|r|r["observation"]["operation"]=="serverq.operation.service.bootstrap" && r["observation"]["exit_code"]==5),"native exit code must be queryable");}
     // § 5: a preparation failure must not boot out a running LaunchAgent or change its registration.
     let release = install.join("releases").join(env!("CARGO_PKG_VERSION")).join("serverq");
     let bytes = fs::read(&release).unwrap();

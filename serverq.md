@@ -3,7 +3,7 @@
 serverq checks server-care rules and reports read-only host, workload and disk inventory to agents and monitors. It never repairs a server, takes commands, runs AI or promises uptime (R2, R3, R8).
 
 This file is the whole contract of **v1**, the Rust binary built on [coreq](https://github.com/taskqorg/coreq). It follows the [specq release contract](https://github.com/taskqorg/specq/blob/main/engineering/release-contract.md); coreq.md holds the shared update, launcher, service and `status.json` detail.
-The runtime uses CoreQ v0.23.3, pinned to `eef0e59040581d5c9d6dc1306bb194ec7c4748ca`, with bounded output, attested updates and R56 self-resource observations. Capture shares the existing writer; Windows tasks use normal priority. Delivery rechecks the current grant before sending.
+The runtime uses CoreQ v0.23.4, pinned to `68d5d5065bd9373d039fa7c5f0ee4e66f7150398`, with bounded output, attested updates and R56 self-resource observations. Capture shares the existing writer; ship passes fix their input sequence; Windows tasks use normal priority. Delivery rechecks the current grant before sending.
 
 ## 1. Principles
 
@@ -101,6 +101,7 @@ One user unit, `serverq.service`, runs the checks and updates.
 - **Delivery is passive (R3).** Delivery never changes a check result, its exit or its schedule; its outcome and retry reason are CoreQ observations. Resource samples never refresh the report: DashQ shows it stale by its own observation time.
 - `service install` serializes with updates, rollback and native service changes through `<install>/lock`, freezes the running binary bytes, calls coreq `prepare_install`, then `activate_install` (current release and launcher), then stops and reinstalls the native unit on Windows/macOS. Preparation failures leave the active service untouched; activation errors report uncertainty.
 - On Linux it then writes `~/.config/systemd/user/serverq.service` running `<install>/serverq service run --home <install>` with `Restart=always`, `RestartSec=10`, and loads it with `daemon-reload` and `enable --now`.
+- macOS stop confirms native absence and the recorded process incarnation has exited within 30 s before a new start. Bootstrap retries once after an observed absent job and exit 5, within a 30 s phase deadline; an uncertain native state never permits a retry.
 - A matching existing unit is restarted so reinstall runs the activated release; another installation's unit is refused. Explicit `update` also restarts an installed service after a successful activation.
 - serverq has one unit per host, not one per project, so it fills coreq's `Unit` itself instead of coreq's `<name>-<project>` unit. Windows: § 7. macOS: § 8. Another OS is an error.
 - A host that must check without a login session needs `loginctl enable-linger <user>` (an operator step; serverq does not run it).
@@ -108,6 +109,7 @@ One user unit, `serverq.service`, runs the checks and updates.
 - `service run` loop: a check 5 min after start, then every `check_every` (3600 s); the coreq update check 15 min after start, then every `update_every` (86400 s). Env `SERVERQ_CHECK_EVERY` and `SERVERQ_UPDATE_EVERY` (seconds) override the periods for tests; each first pass waits at most its period.
 - Own-process resource telemetry and delivery wake every 30 s using CoreQ R56; missing data remains unknown.
 - One loop: a check and an update never overlap. Missed periods do not create catch-up check storms. A check result 1 is a normal pass, not a service failure. An installed update exits 75 and systemd starts the new `current`. Each pass prints one line to the journal.
+- Windows stop snapshots only owned-installation PID and native creation time, excludes the caller and its launcher, and terminates through CoreQ identity fencing. It confirms those incarnations exited within a 30 s phase; unknown identity or exit stays a failure. No process arguments or environments are read.
 - `restart`, `stop` and `uninstall` run `systemctl --user restart`, `stop` and `disable --now`; `uninstall` also deletes the unit file, never the install folder.
 - `<install>/status.json` (coreq common keys, `project` `serverq`) adds `check`: `at`, `exit`, counts per status, `report` path, and `update_at`, `paused`. `error` holds the last check, update or requirement failure (§ 6).
 - `service status` prints `Check: ok|warn|unknown <age>` and `Update: <version|up to date|paused|unknown>`. Human time follows [specq Time](https://github.com/taskqorg/specq/blob/main/caveman/rules/indicators.md#time): age first with exact UTC beside it; an unavailable time reads `? unavailable`. Retry countdowns use the same shared formatter.
