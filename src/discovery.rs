@@ -22,7 +22,7 @@ pub fn runtimes()->Vec<Vec<String>> {
                         let parts:Vec<_>=line.split(':').collect();if parts.len()!=7 {continue;}
                         let user=parts[0];let home=Path::new(parts[5]);
                         if user.bytes().all(|b|b.is_ascii_alphanumeric()||b"_-".contains(&b))&&home.join(".local/share/containers/storage").is_dir() {
-                            if let Ok(uid)=parts[2].parse::<u32>() {if uid>0 {out.push(vec!["runuser".into(),"-u".into(),user.into(),"--".into(),"env".into(),format!("XDG_RUNTIME_DIR=/run/user/{uid}"),"podman".into(),"--remote=false".into()]);}}
+                            if let Ok(uid)=parts[2].parse::<u32>() {if uid>0 {out.push(vec!["runuser".into(),"-u".into(),user.into(),"--".into(),"env".into(),"-u".into(),"DBUS_SESSION_BUS_ADDRESS".into(),format!("XDG_RUNTIME_DIR=/run/user/{uid}"),"podman".into(),"--remote=false".into()]);}}
                         }
                     }
                 }
@@ -46,14 +46,19 @@ pub fn probe(runtime:&[String],args:&[&str])->Result<String,String> {
     crate::command(&argv)
 }
 pub fn containers(runtime:&[String])->Result<Vec<Value>,String> {
-    let listed=probe(runtime,&["container","ls","--all","--quiet","--no-trunc"])?;
+    container_metadata(runtime.iter().any(|arg|arg=="podman"),|args|probe(runtime,args))
+}
+fn container_metadata(podman:bool,mut request:impl FnMut(&[&str])->Result<String,String>)->Result<Vec<Value>,String> {
+    let listed=request(&["container","ls","--all","--quiet","--no-trunc"])?;
     let ids:Vec<_>=listed.split_whitespace().collect();
     if ids.iter().any(|id|id.len()!=64||!id.bytes().all(|c|c.is_ascii_hexdigit())) {return Err("invalid container id".into());}
     let mut rows=vec![];
     for batch in ids.chunks(64) {
-        let mut args=vec!["container","inspect","--format",r#"{"id":{{json .Id}},"name":{{json .Name}},"status":{{json .State.Status}},"pid":{{json .State.Pid}},"image":{{json .Config.Image}},"mounts":{{json .Mounts}}}"#];
+        let format=if podman {r#"{"id":{{json .ID}},"name":{{json .Name}},"status":{{json .State.Status}},"pid":{{json .State.Pid}},"image":{{json .ImageName}},"mounts":{{json .Mounts}}}"#}
+            else {r#"{"id":{{json .Id}},"name":{{json .Name}},"status":{{json .State.Status}},"pid":{{json .State.Pid}},"image":{{json .Config.Image}},"mounts":{{json .Mounts}}}"#};
+        let mut args=vec!["container","inspect","--format",format];
         args.extend_from_slice(batch);
-        let text=probe(runtime,&args)?;
+        let text=request(&args)?;
         let parsed:Result<Vec<Value>,_>=text.lines().map(serde_json::from_str).collect();
         let parsed=parsed.map_err(|_|"invalid container metadata")?;
         if parsed.len()!=batch.len() {return Err("incomplete container metadata".into());}
@@ -192,6 +197,19 @@ fn sites(rows:&mut Vec<Value>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn docker_and_podman_use_their_native_metadata_fields() {
+        for podman in [false,true] {
+            let id="a".repeat(64);
+            let rows=container_metadata(podman,|args| {
+                if args[1]=="ls" {return Ok(id.clone());}
+                let fields=if podman {[".ID", ".ImageName"]}else{[".Id", ".Config.Image"]};
+                if !fields.iter().all(|field|args[3].contains(field)) {return Err("native template rejected".into());}
+                Ok(json!({"id":id,"name":"fixture","status":"running","pid":1,"image":"fixture:1","mounts":[]}).to_string())
+            }).unwrap();
+            assert_eq!(rows[0]["id"],id);assert_eq!(rows[0]["image"],"fixture:1");
+        }
+    }
     #[test]
     fn domain_links_keep_server_blocks_separate_and_never_export_config_values() {
         let mut rows=vec![];
