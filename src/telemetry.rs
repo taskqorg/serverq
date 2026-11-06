@@ -16,21 +16,45 @@ pub fn host_label() -> Option<String> {
 }
 
 pub fn start_capture(home: &Path) -> Option<coreq::telemetry::capture::Runtime> {
-    let result=(|| {
-        let mut builder=std::fs::DirBuilder::new();builder.recursive(true);
-        #[cfg(unix)] {use std::os::unix::fs::DirBuilderExt;builder.mode(0o700);}
-        builder.create(home).map_err(|e|e.to_string())?;
-        let metadata=std::fs::symlink_metadata(home).map_err(|e|e.to_string())?;
-        if !metadata.is_dir() {return Err("telemetry installation root is not a real directory".into());}
-        #[cfg(unix)] {
-            use std::os::unix::fs::MetadataExt;
-            if metadata.uid()!=unsafe {libc::geteuid()} || metadata.mode()&0o077!=0 {
-                return Err("telemetry installation root is not private and owned; permissions unchanged".into());
+    let begin=Instant::now();let at=SystemTime::now().duration_since(UNIX_EPOCH).ok().and_then(|d|u64::try_from(d.as_millis()).ok());
+    let until=begin+Duration::from_secs(30);let mut calls=0u64;
+    loop {
+        calls+=1;
+        let result=(|| {
+            let mut builder=std::fs::DirBuilder::new();builder.recursive(true);
+            #[cfg(unix)] {use std::os::unix::fs::DirBuilderExt;builder.mode(0o700);}
+            builder.create(home).map_err(|e|e.to_string())?;
+            let metadata=std::fs::symlink_metadata(home).map_err(|e|e.to_string())?;
+            if !metadata.is_dir() {return Err("telemetry installation root is not a real directory".into());}
+            #[cfg(unix)] {
+                use std::os::unix::fs::MetadataExt;
+                if metadata.uid()!=unsafe {libc::geteuid()} || metadata.mode()&0o077!=0 {
+                    return Err("telemetry installation root is not private and owned; permissions unchanged".into());
+                }
             }
+            bootstrap(home)
+        })();
+        match result {
+            Ok(runtime)=>{
+                if calls>1 {
+                    let mut value=json!({"product":"serverq","version":crate::VERSION,"operation":"telemetry.bootstrap","kind":"operation",
+                        "started_ms":at,"duration_us":u64::try_from(begin.elapsed().as_micros()).ok(),"calls":calls,
+                        "host":host_label(),"process_id":std::process::id(),"outcome":"retried","error":"installation-budget-lock",
+                        "trace":null,"span":null,"unknown":{"trace":"no-caller","span":"no-caller"}});
+                    for (field,reason) in [("started_ms","clock-unavailable"),("duration_us","duration-overflow"),("host","host-unavailable")] {
+                        if value[field].is_null() {value["unknown"][field]=reason.into();}
+                    }
+                    if let Err(e)=coreq::telemetry::capture::observe(value) {eprintln!("serverq: telemetry unknown: {e}");}
+                }
+                return Some(runtime);
+            }
+            Err(e) if e=="telemetry installation budget lock unavailable" && Instant::now()<until=>{
+                if calls==1 {eprintln!("serverq: telemetry waiting: installation-budget-lock");}
+                std::thread::sleep(Duration::from_millis(100).min(until.saturating_duration_since(Instant::now())));
+            }
+            Err(e)=>{eprintln!("serverq: telemetry unknown: {e}");return None;}
         }
-        bootstrap(home)
-    })();
-    match result { Ok(runtime)=>Some(runtime),Err(e)=>{eprintln!("serverq: telemetry unknown: {e}");None} }
+    }
 }
 
 /// One process collector shares the exact writer used by imports and the shipper.
