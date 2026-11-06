@@ -2,6 +2,15 @@
 
 Binding detail of [serverq.md](../../serverq.md) § 9 under [specq built-in profiling](https://github.com/taskqorg/specq/blob/main/engineering/profiling.md). A change to it edits this file with the contract rules (R10).
 
+## Universal capture
+
+- CLI roots: `serverq.cli.check`, `inspect`, `import`, `rules`, `projection`, `enroll`, `connection`, `disconnect`, `doctor`, `update`, `rollback`, `profile`, `inventory-worker`, `service-run`, `service` and `other` (suffixes of `serverq.cli.`). Command arguments never become operation names.
+- Service passes: `serverq.service.pass`; checks and updates: `serverq.operation.service.check` and `serverq.operation.service.update`. Paused updates are refused with `paused`.
+- Delivery: `serverq.delivery.snapshot` and `serverq.operation.telemetry.ship`; a requested retry records `delivery-retry`, not success. `delivery.retry` records the retry schedule as `retried`, with its source and wait in seconds. Dependency processes use CoreQ capture, including handled failures and timeout/cleanup evidence.
+- Checks inherit their CLI or service caller. Imported inventory keeps its original sample trace and producer time; success still requires durable append. Capture is not an import receipt.
+- The CoreQ runtime owns the single resource watch. CLI and worker samples name their own PID, separate from daemon overhead. Selftest opens and qualifies capture in its temporary installation, closes it, then removes that installation.
+- Universal capture is always on. The legacy counters and optional trace below remain for parity; they do not switch off universal capture.
+
 ## Budgets
 
 Measured operations and budgets (p95 time, failure rate):
