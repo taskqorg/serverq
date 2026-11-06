@@ -447,7 +447,9 @@ fn scan(roots: &[PathBuf], entries: usize, time: Duration) -> Value {
     for root in roots {
         walk.seen.clear();
         let mut row = item("project_root", root.to_string_lossy().into_owned());
-        let size = if priority.is_err() { Err("priority-unavailable") } else {
+        let size = if priority.is_err() { Err("priority-unavailable") }
+        else if walk.remaining==0 {Err("scan-entry-limit")}
+        else if Instant::now()>=walk.deadline {Err("scan-time-limit")} else {
             open_root(root).and_then(|dir| { let meta = dir.dir_metadata().map_err(io_reason)?; walk.tree(&dir, root, 0, &meta) })
         };
         match size {
@@ -787,6 +789,13 @@ mod tests {
             assert_eq!(bad["status"], "unknown");
             assert!(bad["entities"][0]["disk_used_bytes"].is_null());
             assert!(bad["entities"][0]["unknown"]["disk_used_bytes"].is_string());
+        }
+        // Exhausted budgets must win over the I/O error from opening even the next root.
+        let absent=vec![home.join("absent")];
+        for (entries,time,reason) in [(0,Duration::from_secs(SECONDS),"scan-entry-limit"),(ENTRIES,Duration::ZERO,"scan-time-limit")] {
+            let absent=absent.clone();
+            let sample=std::thread::spawn(move || scan(&absent,entries,time)).join().unwrap();
+            assert_eq!(sample["entities"][0]["unknown"]["disk_used_bytes"],reason);
         }
         fs::write(home.join("inventory.json"), b"broken").unwrap();
         assert_eq!(super::roots(&home), Err("invalid-config"));
