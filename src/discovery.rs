@@ -195,13 +195,14 @@ mod tests {
     #[test]
     fn domain_links_keep_server_blocks_separate_and_never_export_config_values() {
         let mut rows=vec![];
-        config(&mut rows,"http { server { server_name a.example; root /srv/a; location / { proxy_set_header Secret invented-secret; } } server { server_name b.example; root /srv/b; } }",false);
+        let root=if cfg!(windows){"C:/srv"}else{"/srv"};
+        config(&mut rows,&format!("http {{ server {{ server_name a.example; root {root}/a; location / {{ proxy_set_header Secret invented-secret; }} }} server {{ server_name b.example; root {root}/b; }} }}"),false);
         assert_eq!(rows.iter().filter(|r|r["entity"]=="site").count(),2);
-        assert!(rows.iter().any(|r|r["from_identity"]=="a.example"&&r["to_identity"]=="/srv/a"));
-        assert!(!rows.iter().any(|r|r["from_identity"]=="a.example"&&r["to_identity"]=="/srv/b"));
+        assert!(rows.iter().any(|r|r["from_identity"]=="a.example"&&r["to_identity"]==format!("{root}/a")));
+        assert!(!rows.iter().any(|r|r["from_identity"]=="a.example"&&r["to_identity"]==format!("{root}/b")));
         assert!(!json!(rows).to_string().contains("invented-secret"));
-        let mut rows=vec![];config(&mut rows,"c.example {\n root * /srv/c\n reverse_proxy 127.0.0.1:8080\n}\n",true);
-        assert!(rows.iter().any(|r|r["from_identity"]=="c.example"&&r["to_identity"]=="/srv/c"));
+        let mut rows=vec![];config(&mut rows,&format!("c.example {{\n root * {root}/c\n reverse_proxy 127.0.0.1:8080\n}}\n"),true);
+        assert!(rows.iter().any(|r|r["from_identity"]=="c.example"&&r["to_identity"]==format!("{root}/c")));
         assert!(rows.iter().any(|r|r["from_identity"]=="c.example"&&r["to_entity"]=="endpoint"&&r["to_identity"]=="127.0.0.1:8080"));
     }
 }

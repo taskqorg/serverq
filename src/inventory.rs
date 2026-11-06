@@ -147,6 +147,10 @@ pub fn collect(home: &Path, status: &str) -> Value {
                     service_accounting(&mut row, &source, before.as_ref().ok(), elapsed);
                 }
                 missing(&mut row, "disk_used_bytes", "not-attributable");
+                if let Some(pid)=source["main_pid"].as_u64().and_then(|p|u32::try_from(p).ok()) {
+                    if let Some(process)=system.process(sysinfo::Pid::from_u32(pid)) {crate::discovery::link(&mut entities,"runs",("service",source["identity"].as_str().unwrap_or("unknown")),("process",&process_identity(process)));}
+                }
+                if let Some(path)=source["working_directory"].as_str().filter(|p|Path::new(p).is_absolute()) {crate::discovery::link(&mut entities,"uses",("service",source["identity"].as_str().unwrap_or("unknown")),("folder",path));}
                 entities.push(row);
             }
         }
@@ -156,7 +160,7 @@ pub fn collect(home: &Path, status: &str) -> Value {
         let mut processes:Vec<_>=system.processes().values().collect();processes.sort_by_key(|p|p.pid());
         let truncated=processes.len()>4096;
         for process in processes.into_iter().take(4096) {
-            let identity=format!("{}:{}:{}",process.name().to_string_lossy(),process.pid().as_u32(),process.start_time());
+            let identity=process_identity(process);
             let mut row=item("process",identity.clone());put(&mut row,"status","observed");
             if let Some(cpu)=usage.get(&process.pid()) {put(&mut row,"cpu_used_milli",*cpu);}
             if process.memory()>0 {put(&mut row,"ram_used_bytes",process.memory());}
@@ -172,7 +176,7 @@ pub fn collect(home: &Path, status: &str) -> Value {
         if !home.join("inventory.json").exists() {
             for row in &entities {
                 if row["entity"]=="link" && row["to_entity"]=="folder" {
-                    if let Some(path)=row["to_identity"].as_str() {let path=PathBuf::from(path);if path.is_dir()&&!roots.contains(&path){roots.push(path);}}
+                    if let Some(path)=row["to_identity"].as_str() {let path=PathBuf::from(path);if path!=Path::new("/")&&!path.starts_with("/proc")&&!path.starts_with("/sys")&&!path.starts_with("/dev")&&path.is_dir()&&!roots.contains(&path){roots.push(path);}}
                 }
             }
         }
@@ -248,6 +252,10 @@ fn roots(home: &Path) -> Result<Vec<PathBuf>, &'static str> {
     Ok(result)
 }
 
+fn process_identity(process:&sysinfo::Process)->String {
+    format!("{}:{}:{}",process.name().to_string_lossy(),process.pid().as_u32(),process.start_time())
+}
+
 fn service_accounting(row: &mut Value, source: &Value, before: Option<&Vec<Value>>, elapsed: f64) {
     for field in ["cpu_used_milli", "ram_used_bytes"] { missing(row, field, "accounting-unavailable"); }
     if source["pid"] == 0 {
@@ -303,7 +311,7 @@ fn probe(argv: &[&str]) -> Result<String, &'static str> {
 
 fn services() -> Result<Vec<Value>, &'static str> {
     if cfg!(target_os = "linux") {
-        let output = probe(&["systemctl", "show", "--all", "--no-pager", "--property=Id,ActiveState,CPUUsageNSec,MemoryCurrent", "*.service"])?;
+        let output = probe(&["systemctl", "show", "--all", "--no-pager", "--property=Id,ActiveState,CPUUsageNSec,MemoryCurrent,MainPID,WorkingDirectory", "*.service"])?;
         let mut rows = vec![];
         for block in output.split("\n\n") {
             let mut row = json!({});
@@ -311,6 +319,8 @@ fn services() -> Result<Vec<Value>, &'static str> {
                 if let Some((key, value)) = line.split_once('=') {
                     match key {
                         "Id" => row["identity"] = value.into(),
+                        "MainPID" => row["main_pid"] = value.parse::<u32>().ok().into(),
+                        "WorkingDirectory" => row["working_directory"] = value.into(),
                         "ActiveState" => row["status"] = value.into(),
                         "CPUUsageNSec" => row["cpu_ns"] = value.parse::<u64>().ok().into(),
                         "MemoryCurrent" => row["ram"] = value.parse::<u64>().ok().into(),
