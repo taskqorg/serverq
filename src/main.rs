@@ -472,9 +472,9 @@ fn end(t: &coreq::Tool) -> Result<(), String> {
                 Err(e)=>return Err(format!("launchctl bootout: {e}")),
             }
             loop {
-                let (loaded,_)=mac_state(&c[2],until)?;
-                let exited=match &old {Some(old)=>coreq::process::identity(old.pid).map_err(|_|"native process identity unavailable")?.as_ref()!=Some(old),None=>true};
-                if !loaded && exited {return Ok(());}
+                let absent=matches!(mac_state(&c[2],until),Ok((false,_)));
+                let exited=match &old {Some(old)=>coreq::process::identity(old.pid).is_ok_and(|current|current.as_ref()!=Some(old)),None=>true};
+                if absent && exited {return Ok(());}
                 if Instant::now()>=until {return Err("native stop timeout; process exit unconfirmed".into());}
                 std::thread::sleep(Duration::from_millis(100).min(until.saturating_duration_since(Instant::now())));
             }
@@ -511,7 +511,7 @@ fn end(t: &coreq::Tool) -> Result<(), String> {
                 Err(_)=>return Err("native process termination unconfirmed".into()),
             }
             loop {
-                if coreq::process::identity(target.pid).map_err(|_|"native process identity unavailable")?.as_ref()!=Some(target) {return Ok(());}
+                if coreq::process::identity(target.pid).is_ok_and(|current|current.as_ref()!=Some(target)) {return Ok(());}
                 if Instant::now()>=until {return Err("native stop timeout; exit unconfirmed".into());}
                 std::thread::sleep(Duration::from_millis(100).min(until.saturating_duration_since(Instant::now())));
             }

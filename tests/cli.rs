@@ -747,7 +747,8 @@ if [ "$1" = list ]; then
  if [ -f "$HOME/loaded" ]; then printf -- '-\t0\tcom.serverq.serverq\n'
  elif [ -f "$HOME/stopping" ]; then
   n=$(cat "$HOME/stopping")
-  if [ "$n" -gt 0 ]; then echo $((n-1)) > "$HOME/stopping"; printf -- '-\t0\tcom.serverq.serverq\n'
+  if [ "$n" -eq 2 ]; then echo 1 > "$HOME/stopping"; exit 5
+  elif [ "$n" -gt 0 ]; then echo $((n-1)) > "$HOME/stopping"; printf -- '-\t0\tcom.serverq.serverq\n'
   else rm "$HOME/stopping"; fi
  fi
  exit 0
