@@ -47,7 +47,18 @@ fn collection(reason: Option<&str>) -> Value {
 
 /// No arguments, executable paths or environments: refresh only the measurements and cwd for attribution.
 fn process_refresh() -> ProcessRefreshKind {
-    ProcessRefreshKind::nothing().without_tasks().with_cpu().with_memory().with_cwd(UpdateKind::Always)
+    ProcessRefreshKind::nothing().without_tasks().with_cpu().with_memory().with_cwd(UpdateKind::Always).with_exe(UpdateKind::Always)
+}
+
+/// A stuck native filesystem call can only hold this worker, not the service's check/update loop.
+pub fn bounded(home:&Path,status:&str)->Value {
+    let result=(|| {
+        let exe=std::env::current_exe().map_err(|_|"worker-unavailable")?;
+        let output=coreq::process::output("inventory.worker",std::process::Command::new(exe).args(["inventory-worker",status,"--home"]).arg(home),Duration::from_secs(60)).map_err(|_|"worker-timeout-or-failure")?;
+        let _=std::io::Write::write_all(&mut std::io::stderr(),&output.stderr);
+        serde_json::from_slice(&output.stdout).map_err(|_|"invalid-worker-sample")
+    })();
+    result.unwrap_or_else(|reason| json!({"trace":crate::sha256(format!("{}",crate::now()).as_bytes())[..32],"at_ms":(crate::now()*1000.0) as u64,"duration_us":null,"entities":[],"collections":{"inventory":{"status":"unknown","reason":reason,"count":null}},"scan":{"status":"unknown","reason":reason,"cpu_us":null,"duration_us":null}}))
 }
 
 pub fn collect(home: &Path, status: &str) -> Value {
@@ -136,36 +147,50 @@ pub fn collect(home: &Path, status: &str) -> Value {
                     service_accounting(&mut row, &source, before.as_ref().ok(), elapsed);
                 }
                 missing(&mut row, "disk_used_bytes", "not-attributable");
+                if let Some(pid)=source["main_pid"].as_u64().and_then(|p|u32::try_from(p).ok()) {
+                    if let Some(process)=system.process(sysinfo::Pid::from_u32(pid)) {crate::discovery::link(&mut entities,"runs",("service",source["identity"].as_str().unwrap_or("unknown")),("process",&process_identity(process)));}
+                }
+                if let Some(path)=source["working_directory"].as_str().filter(|p|Path::new(p).is_absolute()) {crate::discovery::link(&mut entities,"uses",("service",source["identity"].as_str().unwrap_or("unknown")),("folder",path));}
                 entities.push(row);
             }
         }
         Err(reason) => collections["services"] = collection(Some(reason)),
     }
-    match containers() {
-        Ok(rows) => {
-            collections["containers"] = collection(None);
-            for source in rows {
-                let mut row = item("container", source["identity"].as_str().unwrap_or("").trim_start_matches('/'));
-                if source["status"].as_str().is_some_and(code) { put(&mut row, "status", source["status"].clone()); }
-                if source["status"] == "exited" || source["status"] == "created" || source["status"] == "dead" {
-                    put(&mut row, "cpu_used_milli", 0);
-                    put(&mut row, "ram_used_bytes", 0);
-                } else if let Some(pid) = source["pid"].as_u64().and_then(|p| u32::try_from(p).ok()) {
-                    workload(&mut row, &system, &usage, pid);
+    if !cfg!(target_os="macos") {
+        let mut processes:Vec<_>=system.processes().values().collect();processes.sort_by_key(|p|p.pid());
+        let truncated=processes.len()>4096;
+        for process in processes.into_iter().take(4096) {
+            let identity=process_identity(process);
+            let mut row=item("process",identity.clone());put(&mut row,"status","observed");
+            if let Some(cpu)=usage.get(&process.pid()) {put(&mut row,"cpu_used_milli",*cpu);}
+            if process.memory()>0 {put(&mut row,"ram_used_bytes",process.memory());}
+            missing(&mut row,"disk_used_bytes","not-attributable");entities.push(row);
+            if let Some(cwd)=process.cwd().filter(|p|p.is_absolute()) {crate::discovery::link(&mut entities,"uses",("process",&identity),("folder",&cwd.to_string_lossy()));}
+        }
+        collections["processes"]=if truncated {collection(Some("process-limit"))}else{collection(None)};
+    } else {collections["processes"]=collection(Some("unsupported-os"));}
+    collections["containers"]=crate::discovery::collect(&mut entities,|row,pid|workload(row,&system,&usage,pid));
+    collections["sites"]=collection(Some("supported-configurations-only"));
+    collections["discovery"]=collection(Some("known-runtime-and-config-locations-only"));
+    let roots = roots(home).map(|mut roots| {
+        if !home.join("inventory.json").exists() {
+            for row in &entities {
+                if row["entity"]=="link" && row["to_entity"]=="folder" {
+                    if let Some(path)=row["to_identity"].as_str() {let path=PathBuf::from(path);if path!=Path::new("/")&&!path.starts_with("/proc")&&!path.starts_with("/sys")&&!path.starts_with("/dev")&&path.is_dir()&&!roots.contains(&path){roots.push(path);}}
                 }
-                if let Some(n) = source["disk_used_bytes"].as_u64() { put(&mut row, "disk_used_bytes", n); }
-                entities.push(row);
             }
         }
-        Err(reason) => collections["containers"] = collection(Some(reason)),
-    }
-    let roots = roots(home);
+        roots
+    });
     let scan_roots = roots.as_ref().cloned().unwrap_or_default();
     let scan = std::thread::spawn(move || scan(&scan_roots, ENTRIES, Duration::from_secs(SECONDS))).join();
     let mut scan = scan.unwrap_or_else(|_| json!({"status": "unknown", "reason": "worker-failed", "entities": []}));
     if let Err(reason) = &roots {
         scan["status"] = "unknown".into();
         scan["reason"] = (*reason).into();
+    }
+    if !home.join("inventory.json").exists() {
+        for row in scan["entities"].as_array_mut().unwrap() {if row["entity"]=="project_root" {row["entity"]="folder".into();row.as_object_mut().unwrap().remove("cpu_used_milli");row.as_object_mut().unwrap().remove("ram_used_bytes");row["unknown"].as_object_mut().unwrap().remove("cpu_used_milli");row["unknown"].as_object_mut().unwrap().remove("ram_used_bytes");}}
     }
     let projects = scan["entities"].as_array_mut().unwrap();
     for row in projects.iter_mut().filter(|r| r["entity"] == "project_root") {
@@ -194,16 +219,25 @@ pub fn collect(home: &Path, status: &str) -> Value {
     }
     entities.append(projects);
     scan.as_object_mut().unwrap().remove("entities");
-    collections["projects"] = match roots { Ok(_) => collection(None), Err(reason) => collection(Some(reason)) };
+    collections["projects"] = if !home.join("inventory.json").exists() {collection(Some("not-grouped"))} else {match roots { Ok(_) => collection(None), Err(reason) => collection(Some(reason)) }};
     for (name, entity) in [("mounts", "mount"), ("services", "service"), ("containers", "container"), ("projects", "project_root")] {
         collections[name]["count"] = if collections[name]["status"] == "ok" { json!(entities.iter().filter(|r| r["entity"] == entity).count()) } else { Value::Null };
     }
-    json!({"at_ms": at.and_then(|d| u64::try_from(d.as_millis()).ok()), "trace": trace,
+    let mut unique=std::collections::BTreeMap::new();
+    for row in entities {let key=json!([row["entity"],row["identity"]]).to_string();unique.insert(key,row);}
+    let entities:Vec<_>=unique.into_values().collect();
+    let mut entities=entities;
+    if let Some(i)=entities.iter().position(|r|r["entity"]=="host") {entities.swap(0,i);}
+    json!({"host":crate::hostname(),"at_ms": at.and_then(|d| u64::try_from(d.as_millis()).ok()), "trace": trace,
         "duration_us": start.elapsed().as_micros() as u64, "collections": collections, "scan": scan, "entities": entities})
 }
 
 fn roots(home: &Path) -> Result<Vec<PathBuf>, &'static str> {
-    let bytes = fs::read(home.join("inventory.json")).map_err(|e| if e.kind() == std::io::ErrorKind::NotFound { "not-configured" } else { "config-unreadable" })?;
+    let bytes = match fs::read(home.join("inventory.json")) {
+        Ok(bytes)=>bytes,
+        Err(e) if e.kind()==std::io::ErrorKind::NotFound=>return Ok(crate::discovery::roots()),
+        Err(_)=>return Err("config-unreadable"),
+    };
     let value: Value = serde_json::from_slice(&bytes).map_err(|_| "invalid-config")?;
     let roots = value.as_array().ok_or("invalid-config")?;
     let mut result = vec![];
@@ -216,6 +250,10 @@ fn roots(home: &Path) -> Result<Vec<PathBuf>, &'static str> {
         if !result.contains(&path) { result.push(path); }
     }
     Ok(result)
+}
+
+fn process_identity(process:&sysinfo::Process)->String {
+    format!("{}:{}:{}",process.name().to_string_lossy(),process.pid().as_u32(),process.start_time())
 }
 
 fn service_accounting(row: &mut Value, source: &Value, before: Option<&Vec<Value>>, elapsed: f64) {
@@ -273,7 +311,7 @@ fn probe(argv: &[&str]) -> Result<String, &'static str> {
 
 fn services() -> Result<Vec<Value>, &'static str> {
     if cfg!(target_os = "linux") {
-        let output = probe(&["systemctl", "show", "--all", "--no-pager", "--property=Id,ActiveState,CPUUsageNSec,MemoryCurrent", "*.service"])?;
+        let output = probe(&["systemctl", "show", "--all", "--no-pager", "--property=Id,ActiveState,CPUUsageNSec,MemoryCurrent,MainPID,WorkingDirectory", "*.service"])?;
         let mut rows = vec![];
         for block in output.split("\n\n") {
             let mut row = json!({});
@@ -281,6 +319,8 @@ fn services() -> Result<Vec<Value>, &'static str> {
                 if let Some((key, value)) = line.split_once('=') {
                     match key {
                         "Id" => row["identity"] = value.into(),
+                        "MainPID" => row["main_pid"] = value.parse::<u32>().ok().into(),
+                        "WorkingDirectory" => row["working_directory"] = value.into(),
                         "ActiveState" => row["status"] = value.into(),
                         "CPUUsageNSec" => row["cpu_ns"] = value.parse::<u64>().ok().into(),
                         "MemoryCurrent" => row["ram"] = value.parse::<u64>().ok().into(),
@@ -307,27 +347,6 @@ fn services() -> Result<Vec<Value>, &'static str> {
         }
         Ok(rows)
     } else { Err("unsupported-os") }
-}
-
-fn containers() -> Result<Vec<Value>, &'static str> {
-    if !cfg!(target_os = "linux") { return Err("unsupported-os"); }
-    match fs::metadata("/var/run/docker.sock") {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
-        Err(e) => return Err(io_reason(e)),
-    }
-    let ids = probe(&["docker", "--host", "unix:///var/run/docker.sock", "container", "ls", "--all", "--quiet", "--no-trunc"])?;
-    let ids: Vec<_> = ids.split_whitespace().collect();
-    if ids.iter().any(|id| id.len() != 64 || !id.bytes().all(|b| b.is_ascii_hexdigit())) { return Err("collection-failed"); }
-    let mut result = vec![];
-    for batch in ids.chunks(64) {
-        let mut argv = vec!["docker", "--host", "unix:///var/run/docker.sock", "container", "inspect", "--size", "--format",
-            r#"{"identity":{{json .Name}},"status":{{json .State.Status}},"disk_used_bytes":{{json .SizeRw}},"pid":{{json .State.Pid}}}"#];
-        argv.extend_from_slice(batch);
-        let output = probe(&argv)?;
-        for line in output.lines() { result.push(serde_json::from_str(line).map_err(|_| "collection-failed")?); }
-    }
-    Ok(result)
 }
 
 #[cfg(unix)]
@@ -380,6 +399,7 @@ impl Walk {
             if self.remaining == 0 { error = Some("scan-entry-limit"); break; }
             self.remaining -= 1;
             let name = child.file_name();
+            if matches!(name.to_str(),Some("Keys"|".ssh"|".gnupg"|".aws"|".azure"|".kube")) {error=Some("private-directory-excluded");continue;}
             let child_meta = match dir.symlink_metadata(&name) { Ok(m) => m, Err(e) => { error = Some(io_reason(e)); continue; } };
             if link(&child_meta) || !same_device(&child_meta, device) { continue; }
             let result = if child_meta.is_dir() {
@@ -434,7 +454,7 @@ fn scan(roots: &[PathBuf], entries: usize, time: Duration) -> Value {
             Ok(n) => { put(&mut row, "status", "ok"); put(&mut row, "disk_used_bytes", n); }
             Err(r) => { missing(&mut row, "status", r); missing(&mut row, "disk_used_bytes", r); reason = Some(r); }
         }
-        entities.push(row);
+        if !root.as_os_str().is_empty() {entities.push(row);}
     }
     entities.append(&mut walk.folders);
     let duration = start.elapsed().as_micros() as u64;

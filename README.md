@@ -19,9 +19,9 @@ arch=$(uname -m)
 base=https://github.com/taskqorg/serverq/releases/latest/download
 stage=$(mktemp -d) && cd "$stage"
 ver=$(curl -fsSL "$base/latest.json" | sed -n 's/.*"version": *"\([^"]*\)".*/\1/p')
-curl -fsSL -O "$base/serverq-$ver-linux-$arch" -O "$base/SHA256SUMS"
+curl -fsSL -O "$base/serverq-$ver-linux-$arch" -O "$base/SHA256SUMS" -O "$base/provenance.sigstore.jsonl"
 sha256sum --check --ignore-missing SHA256SUMS
-gh attestation verify "serverq-$ver-linux-$arch" --repo taskqorg/serverq   # optional: provenance, needs gh
+gh attestation verify "serverq-$ver-linux-$arch" --bundle provenance.sigstore.jsonl --repo taskqorg/serverq --signer-workflow taskqorg/serverq/.github/workflows/release.yml
 chmod +x "serverq-$ver-linux-$arch" && "./serverq-$ver-linux-$arch" service install
 ```
 
@@ -36,8 +36,9 @@ $base = "https://github.com/taskqorg/serverq/releases/latest/download"
 $ver = (Invoke-RestMethod "$base/latest.json").version
 Invoke-WebRequest "$base/serverq-$ver-windows-x86_64.exe" -OutFile serverq.exe
 Invoke-WebRequest "$base/SHA256SUMS" -OutFile SHA256SUMS
+Invoke-WebRequest "$base/provenance.sigstore.jsonl" -OutFile provenance.sigstore.jsonl
 (Get-FileHash serverq.exe -Algorithm SHA256).Hash   # compare with the line in SHA256SUMS
-gh attestation verify serverq.exe --repo taskqorg/serverq   # optional: provenance, needs gh
+gh attestation verify serverq.exe --bundle provenance.sigstore.jsonl --repo taskqorg/serverq --signer-workflow taskqorg/serverq/.github/workflows/release.yml
 .\serverq.exe service install
 ```
 
@@ -62,10 +63,10 @@ journalctl --user -u serverq                  # one line per check and update pa
 Each completed check also collects host resources, mounts, services and local system-Docker inventory.
 Unavailable fields carry null and a reason. Resource inventory does not change the audit's existing exit codes.
 
-To inventory projects and their largest folders, place an array of absolute project roots in
+Folder discovery needs no project manifest. Data directories, local mounts and container storage provide scan roots. To override discovery, put an array of absolute scan roots in
 `<install>/inventory.json`, for example `["/srv/example"]` (invented path). Use real paths without symlink ancestors.
 Only those trees are scanned, using metadata and background priority; no file contents are read.
-Without this file, project inventory reads unknown `not-configured`.
+Without this file, automatic discovery supplies the roots. Unsupported layouts and bounded/denied scans remain unknown.
 Windows roots use JSON escapes, for example `["C:\\projects\\example"]` (invented path).
 
 The latest sample is under `inventory` in `report.json`. Successive samples stay in CoreQ's observation store
@@ -85,3 +86,13 @@ A `v*` tag builds and publishes the release (`.github/workflows/release.yml`).
 ## Scope limits
 
 ServerQ checks system-level failed units, not user services or application endpoints; preserve existing monitors. Other limits: serverq.md § 1.
+
+## Agent onboarding and fleet analysis
+
+Use the existing authorized SSH connection; never copy the operator's private key to a server. Check the OS, architecture, existing installation, owner and connection first. Use the same installation and identity when reinstalling. Linux servers use a dedicated non-administrative service account with linger. When invoking as that account from an administrative SSH session, clear `DBUS_SESSION_BUS_ADDRESS` and set `XDG_RUNTIME_DIR=/run/user/<its-uid>`; do not add a Docker group or sudo grant to the persistent service. On Mac/Windows use the native user's installation.
+
+Install GitHub CLI 2.49.0 or newer from its trusted distribution if absent. Verify SHA256 and the release-workflow attestation **before** executing the downloaded ServerQ binary. Install the native service, run `doctor` and a fresh check, and enroll through the workspace approval page. Finish only after the running version/PID, native service state, current report, connection receipt and matching DashQ data have been read back. Keep the previous release and installation data for rollback.
+
+For a separately authorized administrative snapshot, run the installed binary's `inspect` command through SSH under the administrator, with an isolated temporary `--home` containing no credentials. It prints a bounded metadata sample: objects, links and the sshhole results for the host and available containers. It never starts a stopped container or attempts a password login. Import the file on that same host as the service owner with `serverq import FILE`; preserve its original time. Do not move account files, hashes, raw configuration or credentials into an import. Repeat diagnostics explicitly when needed; an older check is not current proof.
+
+Read the scoped host inventory in DashQ. An independent agent can use `dashq export --product=serverq` on the authorized dashboard host: JSONL retains typed objects/links, producer times, source and unknown reasons. A folder is not a project, a running process is not application health, and shared volumes must not be added once per container. Recommendations are analysis; moving data, removing services and repairing SSH require their own authorized tasks.

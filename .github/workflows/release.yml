@@ -48,9 +48,10 @@ jobs:
           ver="${GITHUB_REF_NAME#v}"
           perl -pi -e 'if (!$d && s/^version = ".*"/version = "'"$ver"'"/) { $d = 1 }' Cargo.toml
           grep -q "^version = \"$ver\"" Cargo.toml
+          cargo update --workspace
           echo "VER=$ver" >> "$GITHUB_ENV"
-      - run: cargo test
-      - run: cargo build --release --target "$TARGET"
+      - run: cargo test --locked
+      - run: cargo build --locked --release --target "$TARGET"
       - name: Selftest and stage
         run: |
           bin="${CARGO_TARGET_DIR:-target}/$TARGET/release/serverq${{ matrix.ext }}"
@@ -85,11 +86,16 @@ jobs:
           assert set(files) == {'linux-x86_64', 'linux-aarch64', 'windows-x86_64', 'macos-aarch64'}, files
           json.dump({'version': ver, 'files': files}, open('latest.json', 'w'), indent=1)
           PY
-      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+      - id: provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |
             dist/serverq-*
             dist/SHA256SUMS
+      - name: Stage public verification bundle
+        env:
+          BUNDLE: ${{ steps.provenance.outputs.bundle-path }}
+        run: cp "$BUNDLE" dist/provenance.sigstore.jsonl
       - uses: actions/upload-artifact@v4
         with:
           name: release

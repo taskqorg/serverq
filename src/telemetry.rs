@@ -5,7 +5,8 @@ use std::{path::Path, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
 
 #[derive(Default)]
 pub struct Checks {
-    store: Option<Store>,
+    store: Option<std::sync::Arc<Store>>,
+    resources: Option<coreq::resources::Watch>,
 }
 
 // CoreQ exposes cursor initialization through ship; recording must never send a backlog inline.
@@ -129,16 +130,25 @@ impl Checks {
     fn store(&mut self, home: &Path) -> Result<&Store, String> {
         if self.store.is_none() {
             let path = home.join("telemetry.db");
-            let store = Store::open(&path)?;
+            let store = Store::open_bounded(&path,coreq::telemetry::Budget {
+                lock:home.join("telemetry.budget.lock"),peers:vec![],total:coreq::telemetry::INSTALLATION_BYTES,reserved:coreq::telemetry::PEER_BYTES,
+            })?;
             if store.shipper()?["cursor"].is_null() {
                 let initialized = store.ship(&home.join("connection"), &mut Backoff::default(), &mut RetentionOnly);
                 if store.shipper()?["cursor"].is_null() {
                     return Err(format!("shipper initialization failed: {initialized:?}"));
                 }
             }
-            self.store = Some(store);
+            self.store = Some(std::sync::Arc::new(store));
         }
-        Ok(self.store.as_ref().unwrap())
+        Ok(self.store.as_ref().unwrap().as_ref())
+    }
+
+    pub fn start_resources(&mut self,home:&Path) -> Result<(),String> {
+        self.store(home)?;
+        let store=self.store.as_ref().unwrap().clone();
+        self.resources=Some(coreq::resources::watch(home,"serverq",crate::VERSION,move|events|store.append(events).map(|_|()))?);
+        Ok(())
     }
 
     pub fn record(&mut self, home: &Path, operation: &str, start: (SystemTime, Duration), result: &Value) {
@@ -173,7 +183,7 @@ impl Checks {
             let base = |operation: &str| json!({"product": "serverq", "version": crate::VERSION, "kind": "operation",
                 "operation": operation, "trace": sample["trace"], "span": null, "unknown": {"span": "no-caller"},
                 "started_ms": sample["at_ms"], "duration_us": sample["duration_us"],
-                "runtime": format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)});
+                "runtime": format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH), "host": crate::hostname(), "source": if sample["source"]=="ssh-diagnostic" {"ssh-diagnostic"} else {"native"}});
             for row in sample["entities"].as_array().ok_or("invalid-inventory")? {
                 let ok = row["unknown"].as_object().is_some_and(|r| r.is_empty()) && row["status"] != "unknown";
                 let mut event = base("inventory.sample");

@@ -11,6 +11,7 @@ fn scratch(tag: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("serverq-cli-{tag}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&d);
     fs::create_dir_all(&d).unwrap();
+    fs::write(d.join("inventory.json"),"[]").unwrap();
     d
 }
 
@@ -92,6 +93,27 @@ fn inventory_samples_survive_restart_and_ship_without_file_or_environment_conten
     assert_eq!(projects[0]["trace"], first["inventory"]["trace"]);
     drop(store);
     fs::remove_dir_all(home).unwrap();
+}
+
+/// Explicit diagnostics retain original time and reject injected authority before any observation is written.
+#[test]
+fn diagnostic_import_is_host_scoped_typed_and_preserves_producer_time() {
+    let home=scratch("diagnostic-source");let dest=scratch("diagnostic-dest");
+    let me=env!("CARGO_BIN_EXE_serverq");
+    let output=Command::new(me).args(["inspect","--home"]).arg(&home).output().unwrap();
+    assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
+    let mut sample:Value=serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(sample["source"],"ssh-diagnostic");
+    let at=sample["at_ms"].clone();let file=home.join("diagnostic.json");fs::write(&file,sample.to_string()).unwrap();
+    let run=||Command::new(me).arg("import").arg(&file).arg("--home").arg(&dest).output().unwrap();
+    let imported=run();assert!(imported.status.success(),"{}",String::from_utf8_lossy(&imported.stderr));
+    let count={let store=coreq::telemetry::Store::open(&dest.join("telemetry.db")).unwrap();let rows=store.export(0,0,1024).unwrap();
+        assert!(rows["events"].as_array().unwrap().iter().any(|r|r["observation"]["kind"]=="inventory"&&r["observation"]["started_ms"]==at));
+        rows["events"].as_array().unwrap().len()};
+    sample["entities"][0]["command"]="invented-authority".into();fs::write(&file,sample.to_string()).unwrap();
+    assert!(!run().status.success());
+    let store=coreq::telemetry::Store::open(&dest.join("telemetry.db")).unwrap();assert_eq!(store.export(0,0,1024).unwrap()["events"].as_array().unwrap().len(),count);
+    drop(store);fs::remove_dir_all(home).unwrap();fs::remove_dir_all(dest).unwrap();
 }
 
 /// R1/R3/§ 6: command failures name their local cause without exporting raw diagnostics.
@@ -368,8 +390,8 @@ fn text(p: impl AsRef<Path>) -> String {
 #[cfg(target_os = "linux")]
 const FAKE_CURL: &str = r#"#!/bin/sh
 case " $* " in *" --config "*) ;; *)
-  while [ $# -gt 1 ]; do [ "$1" = -o ] && out=$2; shift; done
-  cp "$FAKE_RELEASE/${1##*/}" "$out"; exit;;
+  while [ $# -gt 1 ]; do shift; done
+  cat "$FAKE_RELEASE/${1##*/}"; exit;;
 esac
 cfg=$(cat)
 d=$FAKE_DASH
@@ -439,6 +461,11 @@ fn enrollment_recovers_from_crashes() {
         fs::create_dir_all(p).unwrap();
     }
     write_exe(&bin.join("curl"), FAKE_CURL);
+    write_exe(&bin.join("gh"), r#"#!/bin/sh
+[ "$1" = --version ] && { echo 'gh version 2.49.0'; exit; }
+[ "$FAKE_ATTEST_FAIL" = 1 ] && exit 1
+exit 0
+"#);
     let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
     let cmd = |args: &[&str]| {
         let mut c = Command::new(env!("CARGO_BIN_EXE_serverq"));
@@ -509,6 +536,11 @@ fn service_install_runs_updates_and_rolls_back() {
     }
     write_exe(&bin.join("systemctl"), "#!/bin/sh\necho \"$*\" >> \"$FAKE_LOG\"\n");
     write_exe(&bin.join("curl"), FAKE_CURL);
+    write_exe(&bin.join("gh"), r#"#!/bin/sh
+[ "$1" = --version ] && { echo 'gh version 2.49.0'; exit; }
+[ "$FAKE_ATTEST_FAIL" = 1 ] && exit 1
+exit 0
+"#);
     let incident = r#"{"first_seen": 1, "last_seen": 2, "occurrences": 2, "state": "observed"}"#;
     fs::write(install.join("state.json"), format!(r#"{{"schema": 1, "cache": {{}}, "incidents": {{"disk-headroom": {incident}}}}}"#)).unwrap();
     let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
@@ -541,12 +573,19 @@ fn service_install_runs_updates_and_rolls_back() {
     assert_eq!(text(install.join("current")), version);
     fs::remove_file(&log).unwrap();
     assert!(run(me, &["service", "install"]).status.success());
-    assert_eq!(text(&log).lines().filter(|l| l.starts_with("--user")).collect::<Vec<_>>(), ["--user daemon-reload", "--user enable --now serverq.service"]);
+    assert_eq!(text(&log).lines().filter(|l| l.starts_with("--user")).collect::<Vec<_>>(), ["--user daemon-reload", "--user enable --now serverq.service", "--user restart serverq.service"]);
+
+    // A different installation cannot replace or restart this host's unit.
+    let native=home.join(".config/systemd/user/serverq.service");let owned=fs::read(&native).unwrap();
+    fs::write(&native,"[Service]\nExecStart=/another/installation/serverq service run\n").unwrap();
+    fs::remove_file(&log).unwrap();
+    let refused=run(me,&["service","install"]);assert_eq!(refused.status.code(),Some(2));
+    assert_eq!(text(install.join("current")),version);assert!(!log.exists());fs::write(&native,owned).unwrap();
 
     // the service through the launcher: an hourly check and a daily update, each one second here
     let launcher = install.join("serverq");
     assert_eq!(run(&launcher, &["service", "status"]).status.code(), Some(2), "no status yet is unknown");
-    let mut svc = Command::new(&launcher).args(["service", "run", "--home"]).arg(&install).env("HOME", &home).env("PATH", &path).env("FAKE_RELEASE", &rel)
+    let mut svc = Command::new(&launcher).args(["service", "run", "--home"]).arg(&install).env("HOME", &home).env("PATH", &path).env("FAKE_RELEASE", &rel).env("FAKE_LOG",&log)
         .env("SERVERQ_CHECK_EVERY", "1").env("SERVERQ_UPDATE_EVERY", "1").stdout(std::process::Stdio::null()).spawn().unwrap();
     let status = install.join("status.json");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -580,6 +619,7 @@ fn service_install_runs_updates_and_rolls_back() {
     assert!(!install.join("releases").join(&next).exists() && !install.join("releases").join(format!("{next}.tmp")).exists());
     let sums = Command::new("sha256sum").arg(&asset).current_dir(&rel).output().unwrap().stdout;
     fs::write(rel.join("SHA256SUMS"), sums).unwrap();
+    fs::write(rel.join("provenance.sigstore.jsonl"),"invented bundle for fake gh").unwrap();
     fs::create_dir_all(install.join("releases/stale")).unwrap();
     let updated = run(&launcher, &["update"]);
     assert!(updated.status.success(), "{}", String::from_utf8_lossy(&updated.stderr));
@@ -619,7 +659,7 @@ fn doctor_checks_host_requirements() {
         let o = Command::new(env!("CARGO_BIN_EXE_serverq")).args(["doctor", "--home"]).arg(bin.join("home")).env("PATH", &bin).output().unwrap();
         (o.status.code(), String::from_utf8_lossy(&o.stdout).into_owned())
     };
-    let oldest = [("curl", "echo 'curl 7.20.2 (fake) libcurl/7.20.2'"), ("systemctl", "echo 'systemd 239'"), ("systemd-analyze", "echo 'systemd 239'"), ("docker", "echo 'Docker version 1.13.1, build fake'")];
+    let oldest = [("gh", "echo 'gh version 2.49.0'"), ("curl", "echo 'curl 7.20.2 (fake) libcurl/7.20.2'"), ("systemctl", "echo 'systemd 239'"), ("systemd-analyze", "echo 'systemd 239'"), ("docker", "echo 'Docker version 1.13.1, build fake'")];
     for (name, script) in oldest {
         fake(name, script);
     }

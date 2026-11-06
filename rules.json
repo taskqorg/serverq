@@ -32,5 +32,9 @@
   "compatible-updates": {
     "manual": true,
     "instruction": "Pin trusted releases. Test candidate rules/code, preserve configuration and state, keep rollback and do not interrupt active services. No unattended arbitrary git pull or executing remote incident suggestions."
+  },
+  "sshhole": {
+    "manual": true,
+    "instruction": "Use the explicit read-only inspect diagnostic to assess sshhole on the host and containers. Verify musl, OpenSSH fix evidence, effective authentication configuration and account classes locally; never export hashes or attempt a password login. Do not start stopped containers. Unknown or unqualified backports are not proof of safety. Reference: https://www.openssh.com/txt/release-10.6p2"
   }
 }
