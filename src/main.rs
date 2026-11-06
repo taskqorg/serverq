@@ -1030,7 +1030,10 @@ fn command(argv: &[&str]) -> Result<String, String> {
 fn run_probe(argv: &[&str]) -> Result<String, String> {
     let shown: String=argv.join(" ").chars().take(200).collect();
     let fail=|why:String|format!("`{shown}` collection failed: {why}");
-    let output=coreq::process::output("probe.command",Command::new(argv[0]).args(&argv[1..]),Duration::from_secs(15));
+    let mut command=Command::new(argv[0]);command.args(&argv[1..]);
+    // A root caller's /root working directory is inaccessible after switching to a service user.
+    if cfg!(target_os="linux")&&argv[0]=="runuser" {command.current_dir("/");}
+    let output=coreq::process::output("probe.command",&mut command,Duration::from_secs(15));
     match output {
         Ok(out)=>String::from_utf8(out.stdout).map_err(|_|fail("invalid UTF-8".into())),
         Err(coreq::process::Failure::Exit(out))=>{
