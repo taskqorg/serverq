@@ -168,6 +168,7 @@ serverq follows [specq built-in profiling](https://github.com/taskqorg/specq/blo
 - **Metadata only.** No message text, file content, environment value or credential is stored. Typed inventory identities are the sole exception to the check observations' ban on paths, unit names and container IDs (§ 11).
 - Legacy counters are always on; legacy traces are off until `<install>/trace` exists. Delivery retries keep their CoreQ outcomes and backoff; a retry never establishes recovery.
 - CoreQ universal capture starts before CLI, worker and service execution on the same retained store. Commands, service passes and dependency failures inherit caller context; refusals and delivery retries keep their reasons. Missing terminal evidence stays unknown.
+  Capture creates a private root when absent; an existing linked, non-private or foreign-owned Unix root is refused without changing its permissions.
   Selftest uses only its temporary installation and closes capture before removal. Capture failure remains unknown without changing product exit codes.
 - **Check observations (R1, R3).** Each automated rule evaluation in § 3, including cached and unsupported results, writes one CoreQ `kind: check` observation with the rule ID as `operation`, UTC start, monotonic duration, outcome, error class and host.
   CLI checks, install checks, selftest and service checks use this same path; manual rules emit none. `ok` maps to outcome `ok`, error `none`; `warn` and `unknown` map to `failed`, with the result's stable `reason` as the error class.

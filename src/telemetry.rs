@@ -12,8 +12,17 @@ static STORE: std::sync::OnceLock<(PathBuf, std::sync::Weak<Store>)> = std::sync
 
 pub fn start_capture(home: &Path) -> Option<coreq::telemetry::capture::Runtime> {
     let result=(|| {
-        std::fs::DirBuilder::new().recursive(true).create(home).map_err(|e|e.to_string())?;
-        crate::private(home,0o700).map_err(|e|e.to_string())?;
+        let mut builder=std::fs::DirBuilder::new();builder.recursive(true);
+        #[cfg(unix)] {use std::os::unix::fs::DirBuilderExt;builder.mode(0o700);}
+        builder.create(home).map_err(|e|e.to_string())?;
+        let metadata=std::fs::symlink_metadata(home).map_err(|e|e.to_string())?;
+        if !metadata.is_dir() {return Err("telemetry installation root is not a real directory".into());}
+        #[cfg(unix)] {
+            use std::os::unix::fs::MetadataExt;
+            if metadata.uid()!=unsafe {libc::geteuid()} || metadata.mode()&0o077!=0 {
+                return Err("telemetry installation root is not private and owned; permissions unchanged".into());
+            }
+        }
         bootstrap(home)
     })();
     match result { Ok(runtime)=>Some(runtime),Err(e)=>{eprintln!("serverq: telemetry unknown: {e}");None} }

@@ -11,6 +11,10 @@ fn scratch(tag: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("serverq-cli-{tag}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&d);
     fs::create_dir_all(&d).unwrap();
+    #[cfg(unix)] {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&d,fs::Permissions::from_mode(0o700)).unwrap();
+    }
     fs::write(d.join("inventory.json"),"[]").unwrap();
     d
 }
@@ -793,5 +797,24 @@ esac
     assert!(install.join("current").exists());
     let calls = fs::read_to_string(home.join("calls")).unwrap();
     assert!(calls.lines().all(|line| line.contains("com.serverq.serverq")));
+    fs::remove_dir_all(home).unwrap();
+}
+
+// Capturing a read-only command must not chmod an arbitrary existing directory or follow its link.
+#[cfg(unix)]
+#[test]
+fn capture_refuses_an_unsafe_root_without_changing_it() {
+    use std::os::unix::fs::{PermissionsExt,symlink};
+    let home=scratch("capture-root");
+    let shared=home.join("shared");fs::create_dir(&shared).unwrap();
+    fs::set_permissions(&shared,fs::Permissions::from_mode(0o755)).unwrap();
+    let linked=home.join("linked");symlink(&shared,&linked).unwrap();
+    for root in [&shared,&linked] {
+        let result=Command::new(env!("CARGO_BIN_EXE_serverq")).args(["rules","--home"]).arg(root).output().unwrap();
+        assert!(result.status.success());
+        assert!(String::from_utf8_lossy(&result.stderr).contains("telemetry unknown"));
+        assert_eq!(fs::metadata(&shared).unwrap().permissions().mode()&0o777,0o755);
+        assert!(!shared.join("telemetry.db").exists());
+    }
     fs::remove_dir_all(home).unwrap();
 }
