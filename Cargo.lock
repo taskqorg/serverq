@@ -75,7 +75,7 @@ checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 [[package]]
 name = "coreq"
 version = "0.23.4"
-source = "git+https://github.com/taskqorg/coreq?rev=68d5d5065bd9373d039fa7c5f0ee4e66f7150398#68d5d5065bd9373d039fa7c5f0ee4e66f7150398"
+source = "git+https://github.com/taskqorg/coreq?tag=v0.23.4#ffbcafe764b6dfe0fd5584017dbcc9c2f5b12ba7"
 dependencies = [
  "coreq-instrument",
  "flate2",
@@ -90,7 +90,7 @@ dependencies = [
 [[package]]
 name = "coreq-instrument"
 version = "0.1.0"
-source = "git+https://github.com/taskqorg/coreq?rev=68d5d5065bd9373d039fa7c5f0ee4e66f7150398#68d5d5065bd9373d039fa7c5f0ee4e66f7150398"
+source = "git+https://github.com/taskqorg/coreq?tag=v0.23.4#ffbcafe764b6dfe0fd5584017dbcc9c2f5b12ba7"
 dependencies = [
  "proc-macro2",
  "quote",
